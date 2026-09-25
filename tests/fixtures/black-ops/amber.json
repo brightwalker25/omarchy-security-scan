@@ -1,0 +1,6 @@
+{"schema": 1, "generatedAt": 0, "version": "0.3.0", "master": true, "overall": "warn", "colour": "amber",
+ "helperState": "current", "omarchyChanged": false,
+ "protections": {"holding": 10, "slipped": 2, "unapplied": 0, "attention": 0, "off": 5, "notApplicable": 1},
+ "registered": {"holding": 3, "notHolding": 0},
+ "watch": {"enabled": true, "flagged": 3, "unreviewed": 1, "lastScan": 0},
+ "listen": {"enabled": true, "leaks": 0, "unknownHosts": 40, "retentionHours": 72}}

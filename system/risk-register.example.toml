@@ -1,0 +1,109 @@
+# Risk register for security-report.
+#
+# Each entry records what a finding means on this machine and what is being
+# done about it while it stays open. security-report grades against this file:
+# a finding with no entry is shown as "not yet assessed", which is itself a
+# finding. Keep entries short and dated; re-assess when the version changes.
+#
+# Installed as /etc/security-scan/risk-register.toml only when that file does
+# not exist yet. The entries below are examples of each kind. Replace them
+# with your own assessments; do not trust the ratings here for your machine.
+#
+# rating:  green  = no real exposure (fixed, not reachable, or not installed)
+#          amber  = real but contained; the action says how
+#          red    = needs doing now
+# status:  stale     the Arch tracker still lists it, but the installed
+#                    version is past the upstream fix
+#          open      genuinely unfixed; managed by the action below
+#          accepted  a deliberate choice, with the reason
+
+# ---------------------------------------------------------------------------
+# Package CVEs from arch-audit. Keyed by package name. `assessed_version` is
+# the version that was checked; if the installed version drops below it the
+# report flags the entry for re-assessment.
+#
+# Background: the Arch security tracker is maintained by volunteers and many
+# entries are never closed after the fix ships. Check each one against the
+# upstream fix version before rating it, and state how confident you are.
+# ---------------------------------------------------------------------------
+
+# A stale entry: the tracker still lists it, but the fix is installed.
+[cve.coreutils]
+assessed = 2026-09-23
+assessed_version = "9.11-2"
+status = "stale"
+rating = "green"
+confidence = "high"
+risk = "sort reads out of bounds with a crafted key (CVE-2025-5278)."
+finding = "Fixed upstream in 9.8; 9.11 is installed."
+action = "None needed."
+
+# An open entry: no fix exists, so the action says how the risk is contained.
+[cve.wget]
+assessed = 2026-09-23
+assessed_version = "1.25.0-6"
+status = "open"
+rating = "amber"
+confidence = "medium"
+risk = "wget sends your login to a second site if the first one redirects it (CVE-2021-31879)."
+finding = "Upstream never fixed this in wget 1.x. It only matters when wget is given a username and password."
+action = "Do not use wget with --user or --password; use curl for anything that needs credentials."
+
+# ---------------------------------------------------------------------------
+# Known gitleaks findings. Keyed by a short name; `repo` and `rule` match the
+# log. `repo` must be the absolute path exactly as the log prints it, so write
+# out the home folder rather than using ~. A finding with no entry here is red.
+# ---------------------------------------------------------------------------
+
+[secrets.example-handover]
+assessed = 2026-09-23
+repo = "/home/your-user/Work/example"
+rule = "private-local-identity"
+file = "NOTES.md"
+rating = "amber"
+risk = "NOTES.md contains a private account name in home-directory paths."
+finding = "Committed and pushed, but the repo is private. Not a password or key."
+action = "Replace the paths with ~ before the repo is made public, and clean the history then too."
+
+# ---------------------------------------------------------------------------
+# Standing risks: design choices rather than scan findings. `check` names a
+# live test the report runs; the rating applies while that test holds.
+# The checks available are ufw_active and root_luks.
+# ---------------------------------------------------------------------------
+
+[standing.firewall]
+assessed = 2026-09-23
+check = "ufw_active"
+rating = "green"
+status = "accepted"
+risk = "Inbound connections."
+finding = "ufw denies all inbound connections except the ones you have allowed."
+action = "None needed while ufw stays active."
+
+[standing.disk-encryption]
+assessed = 2026-09-23
+check = "root_luks"
+rating = "green"
+status = "accepted"
+risk = "Data on a lost or stolen machine."
+finding = "The root volume, including /home and swap, is LUKS-encrypted."
+action = "None needed."
+
+# ---------------------------------------------------------------------------
+# Privacy items from Black Ops. Keyed by the item's name; an entry can only
+# lower that item's rating, never raise it. With `count` set, the entry holds
+# only while the count in Black Ops' summary is at or below it, so a new
+# finding is still reported. The names are: unreadable, stale,
+# watch-unreviewed, watch-noscan, slipped, unapplied, attention, registered
+# and warn. A leak seen by listen mode (listen-leak) cannot be accepted here:
+# review it in Black Ops, which is what clears it.
+# ---------------------------------------------------------------------------
+
+[privacy.watch-unreviewed]
+assessed = 2026-09-24
+count = 1
+rating = "green"
+status = "accepted"
+risk = "Installed software contains the address of a tracking service."
+finding = "The one finding is a crash reporter that is switched off in the program's settings."
+action = "Review it in Black Ops when there is time; a second finding is reported again."

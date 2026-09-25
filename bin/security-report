@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""Weekly security report: grades the security-scan logs red, amber, green.
+
+    security-report               colour report in the terminal
+    security-report --plain       same, without colour
+    security-report --all         also list the green items
+    security-report --html FILE   self-contained HTML page
+    security-report --days N      look back N days instead of 7
+    security-report --json        machine-readable, for the bar widget
+    security-report --status      the overall rating and summary line only
+
+Reads /var/log/security-scan (written by `security-scan`) and the risk
+register at /etc/security-scan/risk-register.toml, which records what each
+known finding means here and what is being done about it. A finding with no
+register entry is reported as unassessed rather than silently passed.
+
+The Privacy section reads one file written by Black Ops,
+~/.local/state/black-ops/summary.json, which holds counts only. It never
+reads any other Black Ops file and never runs Black Ops.
+"""
+
+import argparse
+import datetime as dt
+import html
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+LOG_DIR = Path(os.environ.get("LOG_DIR", "/var/log/security-scan"))
+REGISTER = Path(os.environ.get("RISK_REGISTER", "/etc/security-scan/risk-register.toml"))
+
+GREEN, AMBER, RED = "green", "amber", "red"
+# Grey is neutral: off, not installed, or not applicable. It never makes a
+# section or the overall rating worse, so it ranks below green.
+GREY = "grey"
+ORDER = {GREY: -1, GREEN: 0, AMBER: 1, RED: 2}
+
+# How long each scan may go quiet before the silence is itself a finding.
+# Amber at the first number of days, red at the second.
+SCANS = {
+    "arch-audit": ("Daily", 2, 7),
+    "aide": ("Daily", 2, 7),
+    "models": ("Daily", 2, 7),
+    "gitleaks": ("Weekly", 9, 21),
+    "rkhunter": ("Weekly", 9, 21),
+    "lynis": ("Monthly", 35, 62),
+}
+
+
+def worst(*ratings):
+    return max(ratings, key=lambda r: ORDER[r]) if ratings else GREEN
+
+
+def overall_of(sections):
+    # A grey section has nothing to grade, so it does not count. If every
+    # section were grey there would be nothing wrong to report.
+    rated = [s.rating for s in sections if s.rating != GREY]
+    return worst(*rated) if rated else GREEN
+
+
+class Section:
+    def __init__(self, title, rating, headline):
+        self.title = title
+        self.rating = rating
+        self.headline = headline
+        self.items = []  # (rating, what, detail, action)
+
+    def add(self, rating, what, detail="", action=""):
+        self.items.append((rating, what, detail, action))
+        self.rating = worst(self.rating, rating)
+
+
+# --- log reading -------------------------------------------------------------
+
+def logs(mode, since):
+    out = []
+    for p in LOG_DIR.glob(f"{mode}-*.log"):
+        m = re.match(rf"{re.escape(mode)}-(\d{{8}}-\d{{6}})\.log$", p.name)
+        if not m:
+            continue
+        when = dt.datetime.strptime(m.group(1), "%Y%m%d-%H%M%S")
+        # A run that skipped itself (arch-audit offline) is not a result.
+        # Counting it would hide the last real findings behind an empty log.
+        if (summary(read(p)) or "").startswith("skipped"):
+            continue
+        out.append((when, p))
+    out.sort()
+    recent = [(w, p) for w, p in out if w >= since]
+    latest = out[-1] if out else None
+    return recent, latest
+
+
+def read(p):
+    try:
+        return p.read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def summary(text):
+    m = re.findall(r"^summary: (.*)$", text, re.M)
+    return m[-1] if m else None
+
+
+def ago(when, now):
+    d = now - when
+    if d.days >= 1:
+        return f"{d.days} day{'s' if d.days != 1 else ''} ago"
+    h = d.seconds // 3600
+    return f"{h} hour{'s' if h != 1 else ''} ago" if h else "within the hour"
+
+
+# --- sections ----------------------------------------------------------------
+
+def scan_health(now, since):
+    s = Section("Scans ran on schedule", GREEN, "")
+    late = 0
+    for mode, (cadence, amber_days, red_days) in SCANS.items():
+        _, latest = logs(mode, since)
+        if not latest:
+            s.add(RED, f"{mode} has never run", "", f"Check: systemctl status security-scan-{mode}.timer")
+            late += 1
+            continue
+        when, p = latest
+        age = (now - when).days
+        text = read(p)
+        failed = (summary(text) or "").startswith("error") or "!! " in text
+        if failed:
+            s.add(RED, f"{mode}: last run failed ({ago(when, now)})", str(p),
+                  "Read the log; the scan is not protecting anything until this is fixed.")
+        elif age >= red_days:
+            s.add(RED, f"{mode}: {cadence.lower()} scan last ran {ago(when, now)}", "",
+                  f"Check: systemctl status security-scan-{mode}.timer")
+            late += 1
+        elif age >= amber_days:
+            s.add(AMBER, f"{mode}: {cadence.lower()} scan last ran {ago(when, now)}", "",
+                  "Usually the laptop was off or offline; it catches up on its own.")
+            late += 1
+        else:
+            s.add(GREEN, f"{mode}: {cadence.lower()}, last ran {ago(when, now)}")
+    bad = sum(1 for r, *_ in s.items if r != GREEN)
+    s.headline = "All six scans are running on time." if not bad else f"{bad} of 6 scans need attention."
+    return s
+
+
+def packages(now, since, reg, installed):
+    s = Section("Known vulnerabilities in installed packages", GREEN, "")
+    _, latest = logs("arch-audit", since)
+    if not latest:
+        s.rating, s.headline = AMBER, "No arch-audit result yet."
+        return s
+    text = read(latest[1])
+    affected = re.findall(r"^(\S+) is affected by (.*?)\. (High|Medium|Low|Critical) risk!", text, re.M)
+    fixable = re.search(r"(\d+) fixable by upgrade", text)
+    fixable = int(fixable.group(1)) if fixable else 0
+
+    if fixable:
+        s.add(RED, f"{fixable} package(s) have a fix waiting", "",
+              "Run: sudo pacman -Syu")
+
+    cves = reg.get("cve", {})
+    counts = {GREEN: 0, AMBER: 0, RED: 0}
+    for name, what, severity in affected:
+        e = cves.get(name)
+        if not e:
+            r = RED if severity in ("High", "Critical") else AMBER
+            s.add(r, f"{name}: {what} ({severity.lower()} risk)",
+                  "New since the last assessment.",
+                  "Not yet assessed. Ask Claude to assess it and add it to the risk register.")
+            counts[r] += 1
+            continue
+        r = e.get("rating", AMBER)
+        ver = installed.get(name)
+        if ver and e.get("assessed_version") and vercmp(ver, e["assessed_version"]) < 0:
+            r = worst(r, AMBER)
+            s.add(r, f"{name}: installed {ver} is older than the assessed {e['assessed_version']}",
+                  e.get("finding", ""), "Re-assess this entry.")
+        else:
+            label = {"stale": "tracker out of date, already fixed", "open": "no fix yet, managed",
+                     "accepted": "accepted"}.get(e.get("status"), e.get("status", ""))
+            s.add(r, f"{name}: {e.get('risk', what)}", f"{label.capitalize()}. {e.get('finding', '')}",
+                  e.get("action", ""))
+        counts[r] += 1
+
+    total = len(affected)
+    stale = sum(1 for n, *_ in affected if cves.get(n, {}).get("status") == "stale")
+    if not total:
+        s.headline = "No installed package has a known vulnerability."
+    else:
+        parts = [f"The Arch tracker lists {total} package(s)."]
+        if stale:
+            parts.append(f"{stale} are already fixed in the installed version; the tracker has not caught up.")
+        live = total - stale
+        if live:
+            parts.append(f"{live} are genuinely unfixed and managed as described.")
+        if fixable:
+            parts.insert(0, f"{fixable} update(s) are waiting to be installed.")
+        s.headline = " ".join(parts)
+    return s
+
+
+# Package files that a local pacman hook deliberately rewrites, so they always
+# fail pacman's checksum. Kept in step with hook_rewrote() in security-scan,
+# which classifies them at scan time; this copy re-checks a RED line logged
+# before the scanner knew about the hook, against the file as it is now. The
+# log is left as written. Each entry: the hook's files, which must still be
+# installed, and a check of the file's content.
+def _zen_policies_ok(path):
+    try:
+        p = json.loads(Path(path).read_text()).get("policies")
+    except (OSError, ValueError, AttributeError):
+        return False
+    allowed = {"DisableAppUpdate", "DefaultSerialGuardSetting", "DisableTelemetry", "DisableFirefoxStudies"}
+    return (isinstance(p, dict) and set(p) <= allowed
+            and p.get("DisableTelemetry") is True and p.get("DisableFirefoxStudies") is True)
+
+
+HOOK_REWRITTEN = {
+    "/opt/zen-browser-bin/distribution/policies.json": (
+        ("/usr/local/lib/zen-privacy-policy", "/etc/pacman.d/hooks/zen-privacy-policy.hook"),
+        _zen_policies_ok,
+    ),
+}
+
+
+def hook_explains(line):
+    """True when a RED checksum line is a file a local hook rewrites, the hook
+    is still installed, and the file still passes its content check."""
+    m = re.match(r"changed (\S+) \(owned by \S+ but fails pacman's checksum\)$", line)
+    if not m or m.group(1) not in HOOK_REWRITTEN:
+        return False
+    files, ok = HOOK_REWRITTEN[m.group(1)]
+    return all(os.path.exists(f) for f in files) and ok(m.group(1))
+
+
+def integrity(now, since):
+    s = Section("System file integrity (AIDE)", GREEN, "")
+    recent, _ = logs("aide", since)
+    if not recent:
+        s.rating, s.headline = AMBER, "No AIDE result this period."
+        return s
+    reds, ambers, pkg = [], [], 0
+    for when, p in recent:
+        for line in read(p).splitlines():
+            if line.startswith("RED ") and hook_explains(line[4:]):
+                pkg += 1
+            elif line.startswith("RED "):
+                reds.append((when, line[4:]))
+            elif line.startswith("AMBER "):
+                ambers.append((when, line[6:]))
+            elif line.startswith("PKG "):
+                pkg += 1
+    for when, line in reds:
+        s.add(RED, line, when.strftime("%a %d %b"),
+              "A system file changed outside any package update. Do not ignore: compare with "
+              "pacman -Qkk, and if unexplained treat the machine as compromised.")
+    # Amber changes are mostly your own edits; group them by folder so a week
+    # of work reads as a few lines, not hundreds.
+    groups = {}
+    for when, line in ambers:
+        m = re.match(r"(\w+) (\S+)", line)
+        path = m.group(2) if m else line
+        key = "/".join(path.split("/")[:4])
+        groups.setdefault(key, []).append(path)
+    for key, paths in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        example = paths[0] if len(paths) == 1 else f"{len(paths)} files, e.g. {paths[0]}"
+        s.add(AMBER, f"Changed outside a package: {key}", example,
+              "Confirm these were your own changes (installs, config edits).")
+    runs = len(recent)
+    if reds:
+        s.headline = f"{len(reds)} unexplained change(s) to system files."
+    elif ambers:
+        s.headline = (f"{runs} check(s) ran. No unexplained changes. {len(ambers)} change(s) "
+                      f"outside packages to confirm; {pkg} came from package updates.")
+    else:
+        s.headline = f"{runs} check(s) ran. Nothing changed except through package updates ({pkg} files)."
+    return s
+
+
+def rootkit(now, since):
+    s = Section("Rootkit check (rkhunter)", GREEN, "")
+    recent, _ = logs("rkhunter", since)
+    if not recent:
+        s.rating, s.headline = AMBER, "No rkhunter result this period."
+        return s
+    warned = 0
+    for when, p in recent:
+        text = read(p)
+        m = re.search(r"summary: (\d+) warning", text)
+        n = int(m.group(1)) if m else 0
+        if n:
+            warned += n
+            # A "properties changed" warning whose files pacman verified was
+            # accepted by the scanner; only its UNVERIFIED files still count.
+            found = [w for w in re.findall(r"^Warning: (.*)$", text, re.M)
+                     if "file properties have changed" not in w]
+            found += [f"File changed and pacman cannot vouch for it: {f}"
+                      for f in re.findall(r"^UNVERIFIED (.*)$", text, re.M)]
+            for w in found:
+                s.add(RED, w, when.strftime("%a %d %b"),
+                      "Investigate before anything else. If it is a new false positive, "
+                      "verify with pacman -Qkk and add it to /etc/rkhunter.conf.local.")
+    s.headline = (f"{warned} warning(s)." if warned
+                  else f"{len(recent)} check(s) ran with no warnings.")
+    return s
+
+
+def models(now, since):
+    s = Section("AI model files", GREEN, "")
+    recent, latest = logs("models", since)
+    if not recent:
+        s.rating, s.headline = AMBER, "No model scan this period."
+        return s
+    dangerous = suspicious = 0
+    for when, p in recent:
+        text = read(p)
+        for line in re.findall(r"^(.*(?:dangerous|suspicious) import.*)$", text, re.M):
+            bad = "dangerous" in line
+            dangerous += bad
+            suspicious += not bad
+            s.add(RED if bad else AMBER, line, when.strftime("%a %d %b"),
+                  "Do not load this file. Delete it and get the model as .safetensors instead."
+                  if bad else "Check where the file came from before loading it.")
+    last = summary(read(latest[1])) or ""
+    m = re.search(r"(\d+) pickle-format", last)
+    pickles = int(m.group(1)) if m else 0
+    if not dangerous and not suspicious:
+        s.headline = (f"{len(recent)} scan(s), nothing malicious. {pickles} model file(s) use the "
+                      "older pickle format; all scanned clean.")
+        if pickles:
+            s.add(GREEN, f"{pickles} pickle-format file(s) present, scanned clean",
+                  "Pickle files can run code when loaded; safetensors and GGUF cannot.",
+                  "Prefer .safetensors when downloading models.")
+    else:
+        s.headline = f"{dangerous} dangerous and {suspicious} suspicious model file(s)."
+    return s
+
+
+def secrets(now, since, reg):
+    s = Section("Secrets in your code (gitleaks)", GREEN, "")
+    _, latest = logs("gitleaks", since)
+    if not latest:
+        s.rating, s.headline = AMBER, "No gitleaks result yet."
+        return s
+    text = read(latest[1])
+    known = reg.get("secrets", {})
+    total = 0
+    for repo, n in re.findall(r"^--- (\S+): (\d+) finding", text, re.M):
+        total += int(n)
+        block = text.split(f"--- {repo}:", 1)[1]
+        rules = set(re.findall(r'"RuleID": "([^"]+)"', block.split("\n--- ", 1)[0]))
+        entry = next((e for e in known.values()
+                      if e.get("repo") == repo and e.get("rule") in rules), None)
+        name = Path(repo).name
+        if entry:
+            s.add(entry.get("rating", AMBER), f"{name}: {entry.get('risk', '')}",
+                  entry.get("finding", ""), entry.get("action", ""))
+        else:
+            s.add(RED, f"{name}: {n} possible secret(s) ({', '.join(sorted(rules))})",
+                  f"From the scan on {latest[0]:%a %d %b}.",
+                  "Check the log. Rotate any real key or password, then remove it from the repo.")
+    s.headline = ("No secrets found in the scanned repositories." if not total
+                  else f"{total} finding(s); see below for what each one is.")
+    return s
+
+
+def hardening(now, since):
+    s = Section("System hardening (lynis, monthly)", GREEN, "")
+    _, latest = logs("lynis", dt.datetime.min)
+    if not latest:
+        s.rating, s.headline = AMBER, "No lynis audit yet."
+        return s
+    text = read(latest[1])
+    m = re.search(r"hardening index (\d+)", text)
+    index = int(m.group(1)) if m else None
+    warns = re.findall(r"^warning\[\]=([^|]+)\|([^|]+)", text, re.M)
+    for wid, msg in warns:
+        # lynis flags any arch-audit output, which the package section
+        # already grades properly.
+        if wid == "PKGS-7322":
+            s.add(GREEN, f"{msg} ({wid})", "", "Covered by the package section above.")
+        else:
+            s.add(AMBER, f"{msg} ({wid})", "", f"Run: sudo lynis show details {wid}")
+    s.headline = (f"Hardening score {index}/100 on {latest[0]:%d %b}. "
+                  "A score in the high 60s is typical for a desktop; the suggestions are mostly "
+                  "server hardening.") if index is not None else "No score recorded."
+    return s
+
+
+def standing(reg):
+    s = Section("Standing risks", GREEN, "")
+    checks = {
+        "ufw_active": lambda: run(["systemctl", "is-active", "ufw"]).strip() == "active",
+        # The device holding / must itself be a LUKS mapping, not merely some
+        # disk on the machine.
+        "root_luks": lambda: "crypt" in run(["lsblk", "-no", "TYPE",
+                                              run(["findmnt", "-no", "SOURCE", "/"]).strip().split("[")[0]]).split(),
+    }
+    for key, e in reg.get("standing", {}).items():
+        test = checks.get(e.get("check"))
+        holds = test() if test else True
+        r = e.get("rating", AMBER)
+        if not holds:
+            r = RED
+            s.add(r, e.get("risk", key), "This protection is no longer in place.",
+                  "Check why, then update the register.")
+        else:
+            s.add(r, e.get("risk", key), e.get("finding", ""), e.get("action", ""))
+    s.headline = "Design choices and protections checked live."
+    return s
+
+
+# --- privacy (Black Ops) -----------------------------------------------------
+
+# Black Ops writes the summary each time its watchdog runs, which is far more
+# often than weekly. A summary older than this means the watchdog stopped, and
+# the counts in it can no longer be trusted as current.
+PRIVACY_STALE_DAYS = 8
+SUMMARY_REL = Path(".local/state/black-ops/summary.json")
+
+
+def summary_location(environ=None, euid=None, getpwnam=pwd.getpwnam, getpwuid=pwd.getpwuid):
+    """Where to find the Black Ops summary, and a note on how it was chosen.
+
+    Returns (path or None, note). The note is shown in the report and never
+    names the account, because the HTML report is written to disk.
+    """
+    environ = os.environ if environ is None else environ
+    euid = os.geteuid() if euid is None else euid
+    if environ.get("BLACK_OPS_SUMMARY"):
+        return Path(environ["BLACK_OPS_SUMMARY"]), "Read from the path in BLACK_OPS_SUMMARY."
+    if euid == 0:
+        # Run through sudo: the summary that matters is the invoking user's,
+        # not root's. The environment under sudo belongs to root, so the
+        # home folder comes from the password database.
+        who = environ.get("SUDO_USER", "")
+        if who and who != "root":
+            try:
+                return (Path(getpwnam(who).pw_dir) / SUMMARY_REL,
+                        "Run as root through sudo, so the invoking user's summary was read.")
+            except KeyError:
+                pass
+        return None, ("Run as root with no invoking user, so no summary was read. "
+                      "Black Ops keeps its summary per user; run the report as that user.")
+    state = environ.get("XDG_STATE_HOME", "")
+    if state and os.path.isabs(state):
+        return Path(state) / "black-ops/summary.json", ""
+    try:
+        home = Path(getpwuid(euid).pw_dir)
+    except KeyError:
+        home = Path(environ.get("HOME", "~")).expanduser()
+    return home / SUMMARY_REL, ""
+
+
+def _count(obj, *keys):
+    """A non-negative integer from nested keys, or 0 when absent or not a count."""
+    for k in keys:
+        obj = obj.get(k) if isinstance(obj, dict) else None
+    return obj if isinstance(obj, int) and not isinstance(obj, bool) and obj > 0 else 0
+
+
+def _flag(obj, *keys):
+    for k in keys:
+        obj = obj.get(k) if isinstance(obj, dict) else None
+    return obj is True
+
+
+def privacy(now, reg, location=None):
+    s = Section("Privacy (Black Ops)", GREEN, "")
+    path, note = location if location is not None else summary_location()
+    accepted = reg.get("privacy", {}) if isinstance(reg.get("privacy"), dict) else {}
+
+    def add(key, rating, what, detail="", action="", count=None):
+        # A register entry may lower the rating of one item, for example to
+        # accept unreviewed watch findings while they are looked into. A
+        # confirmed leak cannot be accepted here: review it in Black Ops,
+        # which is what clears its red. With `count` set, the entry holds only
+        # while the count stays at or below it, so a new finding is not hidden.
+        e = accepted.get(key)
+        if (isinstance(e, dict) and key != "listen-leak"
+                and e.get("rating") in ORDER and ORDER[e["rating"]] < ORDER[rating]
+                and (count is None or not isinstance(e.get("count"), int) or count <= e["count"])):
+            rating = e["rating"]
+            detail = " ".join(x for x in (detail, e.get("finding", "")) if x)
+            action = e.get("action", action)
+        s.add(rating, what, detail, action)
+
+    if path is None:
+        s.rating, s.headline = GREY, "Not checked. " + note
+        return s
+    rel = "~/.local/state/black-ops/summary.json"
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        s.rating = GREY
+        s.headline = "Black Ops is not installed, or is older than 0.3.0. Nothing here was checked."
+        s.add(GREY, f"No Black Ops summary at {rel}", note,
+              "Nothing to do unless you use Black Ops. If you do, open its panel once so it writes the summary.")
+        return s
+    except OSError as err:
+        add("unreadable", AMBER, "The Black Ops summary exists but cannot be read",
+            f"{err.strerror}. {note}".strip(), "Check the file's owner and permissions.")
+        s.headline = "The summary could not be read, so privacy is not being checked."
+        return s
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except ValueError:
+        add("unreadable", AMBER, "The Black Ops summary is not valid JSON", note,
+            "Open the Black Ops panel so it rewrites the file. If this keeps happening, report it to Black Ops.")
+        s.headline = "The summary could not be read, so privacy is not being checked."
+        return s
+    if data.get("schema") != 1:
+        add("unreadable", AMBER, "The Black Ops summary is in a format this report does not know",
+            "It was probably written by a newer Black Ops.", "Update Security Scan.")
+        s.headline = "The summary could not be read, so privacy is not being checked."
+        return s
+
+    if data.get("master") is not True or data.get("overall") == "off":
+        s.rating = GREY
+        s.headline = "Black Ops is switched off. Nothing here was checked, and that is not counted as a problem."
+        s.add(GREY, "Black Ops is off", note, "Switch it on in its panel if you want privacy checked.")
+        return s
+
+    stale = False
+    when = data.get("generatedAt")
+    if isinstance(when, (int, float)) and not isinstance(when, bool) and when > 0:
+        written = dt.datetime.fromtimestamp(when)
+        age = max(now - written, dt.timedelta(0))
+        if age.days >= PRIVACY_STALE_DAYS:
+            stale = True
+            add("stale", AMBER, f"The Black Ops summary was last written {ago(written, now)}",
+                "Black Ops refreshes it every time its watchdog runs, so the watchdog has stopped. "
+                "The counts below are from then.",
+                "Open the Black Ops panel, and check that its watchdog is running.")
+    else:
+        stale = True
+        add("stale", AMBER, "The Black Ops summary does not say when it was written", "",
+            "Open the Black Ops panel so it rewrites the file.")
+
+    leaks = _count(data, "listen", "leaks")
+    if _flag(data, "listen", "enabled"):
+        if leaks:
+            add("listen-leak", RED, f"Listen mode saw {leaks} contact(s) with a telemetry host, not yet reviewed",
+                "A program on this machine sent data to a known telemetry, analytics or crash-report service.",
+                "Open Black Ops to see which program it was. Remove or block it, or review it there if it is expected.")
+        else:
+            unknown = _count(data, "listen", "unknownHosts")
+            add("listen-clean", GREEN, "Listen mode is on and saw no telemetry contacts",
+                f"{unknown} host(s) matched no known signature; that is information only." if unknown else "")
+    else:
+        add("listen-off", GREY, "Listen mode is off, so contacts with telemetry hosts are not being watched", "",
+            "Nothing to do. Switch it on in Black Ops if you want contacts watched.")
+    if leaks == 0 and data.get("overall") == "leak":
+        add("listen-leak", RED, "Black Ops reports a leak", "",
+            "Open Black Ops to see which program it was, and remove, block or review it.")
+
+    if _flag(data, "watch", "enabled"):
+        unrev = _count(data, "watch", "unreviewed")
+        flagged = _count(data, "watch", "flagged")
+        if unrev:
+            add("watch-unreviewed", AMBER, f"The software watch has {unrev} finding(s) not yet reviewed",
+                "Installed software contains the address of a known tracking service.",
+                "Open Black Ops and mark each one Allow or False positive.", count=unrev)
+        else:
+            add("watch-clean", GREEN, "The software watch has nothing waiting for review",
+                f"{flagged} finding(s) already reviewed." if flagged else "")
+        last = data["watch"].get("lastScan")
+        if not (isinstance(last, (int, float)) and not isinstance(last, bool) and last > 0):
+            add("watch-noscan", AMBER, "The software watch has not finished a scan yet", "",
+                "The first scan runs within a day of switching it on. If it is older than that, check it in Black Ops.")
+        elif (now - dt.datetime.fromtimestamp(last)).days >= PRIVACY_STALE_DAYS:
+            add("watch-noscan", AMBER,
+                f"The software watch last finished a scan {ago(dt.datetime.fromtimestamp(last), now)}", "",
+                "Check it in Black Ops; its timers may have stopped.")
+    else:
+        add("watch-off", GREY, "The software watch is off, so installed software is not checked for tracking", "",
+            "Nothing to do. Switch it on in Black Ops if you want software checked.")
+
+    holding = _count(data, "protections", "holding")
+    for key, n, what, action in (
+        ("slipped", _count(data, "protections", "slipped"),
+         "protection(s) were in place and have slipped",
+         "Open Black Ops to see which, and switch each one on again. An update may have undone it."),
+        ("unapplied", _count(data, "protections", "unapplied"),
+         "protection(s) are switched on but not yet in place",
+         "Open Black Ops and apply them."),
+        ("attention", _count(data, "protections", "attention"),
+         "protection(s) are in place but need a look",
+         "Open Black Ops; each one says what it needs."),
+        ("registered", _count(data, "registered", "notHolding"),
+         "protection(s) registered by other plugins are not holding",
+         "Open Black Ops to see which, and fix them in the plugin that registered them."),
+    ):
+        if n:
+            add(key, AMBER, f"{n} {what}", "", action, count=n)
+    reg_holding = _count(data, "registered", "holding")
+    off = _count(data, "protections", "off")
+    detail = f"{off} more are switched off by choice." if off else ""
+    add("holding", GREEN, f"{holding + reg_holding} protection(s) holding", detail)
+
+    # Black Ops says "warn" for the counts above, which the register may have
+    # accepted. Only a warning that none of them explains is added here.
+    explained = any(_count(data, *k) for k in (
+        ("watch", "unreviewed"), ("protections", "slipped"), ("protections", "unapplied"),
+        ("protections", "attention"), ("registered", "notHolding")))
+    if not explained and data.get("overall") == "warn":
+        add("warn", AMBER, "Black Ops reports something needs attention", "",
+            "Open Black Ops; the rows that need a look are amber.")
+
+    reds = sum(1 for r, *_ in s.items if r == RED)
+    ambers = sum(1 for r, *_ in s.items if r == AMBER)
+    parts = []
+    if reds:
+        parts.append("Listen mode saw a program on this machine contact a telemetry service.")
+    if ambers:
+        parts.append(f"{ambers} item(s) need a look.")
+    if not reds and not ambers:
+        parts.append("Black Ops is on and nothing needs a look.")
+    if stale:
+        parts.append("The counts are out of date.")
+    offs = [n for k, n in (("listen", "listen mode"), ("watch", "the software watch"))
+            if not _flag(data, k, "enabled")]
+    if offs:
+        parts.append(f"{' and '.join(offs).capitalize()} {'is' if len(offs) == 1 else 'are'} off.")
+    if not stale and isinstance(when, (int, float)) and now - dt.datetime.fromtimestamp(when) >= dt.timedelta(hours=1):
+        parts.append(f"Last written {ago(dt.datetime.fromtimestamp(when), now)}.")
+    if note:
+        parts.append(note)
+    s.headline = " ".join(parts)
+    return s
+
+
+# --- helpers -----------------------------------------------------------------
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def vercmp(a, b):
+    out = run(["vercmp", a, b]).strip()
+    try:
+        return int(out)
+    except ValueError:
+        return 0
+
+
+def installed_versions():
+    out = {}
+    for line in run(["pacman", "-Q"]).splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[0]] = parts[1]
+    return out
+
+
+# --- output ------------------------------------------------------------------
+
+LABEL = {GREY: "GREY", GREEN: "GREEN", AMBER: "AMBER", RED: "RED"}
+DOT = {GREY: "○", GREEN: "●", AMBER: "▲", RED: "■"}
+ANSI = {GREY: "\033[90m", GREEN: "\033[32m", AMBER: "\033[33m", RED: "\033[31m"}
+
+
+def overall_line(overall, sections):
+    reds = sum(1 for s in sections for r, *_ in s.items if r == RED)
+    ambers = sum(1 for s in sections for r, *_ in s.items if r == AMBER)
+    if overall == GREEN:
+        return "Nothing needs your attention."
+    if overall == RED:
+        return f"{reds} item(s) need action now; {ambers} are being managed."
+    return f"Nothing urgent. {ambers} item(s) are open and being managed."
+
+
+def text_report(sections, overall, start, end, colour, show_all=False):
+    def c(r, t):
+        return f"{ANSI[r]}{t}\033[0m" if colour else t
+    bold = (lambda t: f"\033[1m{t}\033[0m") if colour else (lambda t: t)
+    out = [bold(f"Security report, {start:%a %d %b} to {end:%a %d %b %Y}"),
+           f"Overall: {c(overall, DOT[overall] + ' ' + LABEL[overall])}. {overall_line(overall, sections)}", ""]
+    for s in sections:
+        out.append(f"{c(s.rating, DOT[s.rating] + ' ' + LABEL[s.rating]):<8}  {bold(s.title)}")
+        out.append(f"          {s.headline}")
+        hidden = 0
+        for r, what, detail, action in sorted(s.items, key=lambda i: -ORDER[i[0]]):
+            # In a section that needs attention, green lines are noise unless
+            # asked for; they are counted instead.
+            if r == GREEN and s.rating not in (GREEN, GREY) and not show_all:
+                hidden += 1
+                continue
+            out.append(f"          {c(r, DOT[r])} {what}")
+            if detail:
+                out.append(f"              {detail}")
+            if action and r != GREEN:
+                out.append(f"              What is being done: {action}")
+        if hidden:
+            out.append(f"          {c(GREEN, DOT[GREEN])} {hidden} more item(s) are green (--all lists them)")
+        out.append("")
+    return "\n".join(out)
+
+
+def html_report(sections, overall, start, end):
+    e = html.escape
+    rows = []
+    for s in sections:
+        items = []
+        for r, what, detail, action in sorted(s.items, key=lambda i: -ORDER[i[0]]):
+            items.append(
+                f'<li class="{r}"><span class="pill {r}">{LABEL[r]}</span>'
+                f'<div><div class="what">{e(what)}</div>'
+                + (f'<div class="detail">{e(detail)}</div>' if detail else "")
+                + (f'<div class="action"><b>What is being done:</b> {e(action)}</div>' if action else "")
+                + "</div></li>")
+        rows.append(
+            f'<details class="card {s.rating}" {"open" if s.rating not in (GREEN, GREY) else ""}>'
+            f'<summary><span class="pill {s.rating}">{LABEL[s.rating]}</span>'
+            f'<span class="title">{e(s.title)}</span></summary>'
+            f'<p class="headline">{e(s.headline)}</p><ul>{"".join(items)}</ul></details>')
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security report</title>
+<style>
+:root {{ --bg:#f6f6f4; --card:#fff; --ink:#1d1d1b; --muted:#5f5f5a; --line:#e2e2dd;
+  --green:#1f7a3f; --green-bg:#e3f3e8; --amber:#8a5a00; --amber-bg:#fdf0d5;
+  --red:#b3261e; --red-bg:#fbe3e1; --grey:#5f5f5a; --grey-bg:#ecece8; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#141413; --card:#1f1f1d; --ink:#ecece8;
+  --muted:#a3a39c; --line:#33332f; --green:#6fd08c; --green-bg:#16301f; --amber:#f2c14e;
+  --amber-bg:#3a2d10; --red:#ff8a80; --red-bg:#3d1916; --grey:#a3a39c; --grey-bg:#2a2a27; }} }}
+body {{ margin:0; background:var(--bg); color:var(--ink);
+  font:15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
+main {{ max-width:860px; margin:0 auto; padding:24px 16px 48px; }}
+h1 {{ font-size:22px; margin:0 0 4px; }}
+.sub {{ color:var(--muted); margin:0 0 20px; }}
+.overall {{ display:flex; gap:12px; align-items:center; padding:16px; border-radius:10px;
+  background:var(--card); border:1px solid var(--line); margin-bottom:20px; }}
+.overall .pill {{ font-size:15px; padding:6px 14px; }}
+.card {{ background:var(--card); border:1px solid var(--line); border-left:6px solid var(--line);
+  border-radius:10px; margin:0 0 12px; padding:12px 16px; }}
+.card.green {{ border-left-color:var(--green); }} .card.amber {{ border-left-color:var(--amber); }}
+.card.red {{ border-left-color:var(--red); }} .card.grey {{ border-left-color:var(--grey); }}
+summary {{ cursor:pointer; display:flex; gap:10px; align-items:center; list-style:none; }}
+summary::-webkit-details-marker {{ display:none; }}
+.title {{ font-weight:600; }}
+.headline {{ margin:8px 0; }}
+ul {{ list-style:none; padding:0; margin:0; }}
+li {{ display:flex; gap:10px; padding:10px 0; border-top:1px solid var(--line); }}
+.pill {{ flex:none; font-size:11px; font-weight:700; letter-spacing:.04em; padding:2px 8px;
+  border-radius:999px; height:fit-content; }}
+.pill.green {{ color:var(--green); background:var(--green-bg); }}
+.pill.amber {{ color:var(--amber); background:var(--amber-bg); }}
+.pill.red {{ color:var(--red); background:var(--red-bg); }}
+.pill.grey {{ color:var(--grey); background:var(--grey-bg); }}
+.what {{ font-weight:500; overflow-wrap:anywhere; }}
+.detail {{ color:var(--muted); overflow-wrap:anywhere; }}
+.action {{ margin-top:4px; }}
+</style></head><body><main>
+<h1>Security report</h1>
+<p class="sub">{start:%a %d %b} to {end:%a %d %b %Y}, generated {end:%H:%M}</p>
+<div class="overall"><span class="pill {overall}">{LABEL[overall]}</span>
+<span>{e(overall_line(overall, sections))}</span></div>
+{"".join(rows)}
+</main></body></html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--plain", action="store_true")
+    ap.add_argument("--all", action="store_true", help="list green items too")
+    ap.add_argument("--html", metavar="FILE")
+    ap.add_argument("--status", action="store_true", help="print only the overall rating")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    a = ap.parse_args()
+
+    now = dt.datetime.now().replace(microsecond=0)
+    since = now - dt.timedelta(days=a.days)
+    try:
+        reg = tomllib.loads(REGISTER.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as err:
+        print(f"security-report: cannot read {REGISTER}: {err}", file=sys.stderr)
+        reg = {}
+
+    sections = [
+        scan_health(now, since),
+        packages(now, since, reg, installed_versions()),
+        integrity(now, since),
+        rootkit(now, since),
+        models(now, since),
+        secrets(now, since, reg),
+        hardening(now, since),
+        standing(reg),
+        privacy(now, reg),
+    ]
+    overall = overall_of(sections)
+
+    if a.json:
+        print(json.dumps({
+            "overall": overall,
+            "line": overall_line(overall, sections),
+            "start": since.isoformat(),
+            "end": now.isoformat(),
+            "sections": [{
+                "title": s.title, "rating": s.rating, "headline": s.headline,
+                "items": [{"rating": r, "what": w, "detail": d, "action": act}
+                          for r, w, d, act in sorted(s.items, key=lambda i: -ORDER[i[0]])],
+            } for s in sections],
+        }))
+    elif a.status:
+        print(f"{LABEL[overall]}: {overall_line(overall, sections)}")
+    elif a.html:
+        Path(a.html).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.html).write_text(html_report(sections, overall, since, now))
+        print(a.html)
+    else:
+        print(text_report(sections, overall, since, now, colour=not a.plain and sys.stdout.isatty(), show_all=a.all))
+    return {GREY: 0, GREEN: 0, AMBER: 0, RED: 1}[overall]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

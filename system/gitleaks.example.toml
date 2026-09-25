@@ -1,0 +1,45 @@
+# Ruleset for the periodic gitleaks scan of the repositories under SCAN_ROOT.
+#
+# Extends the upstream default rules (AWS keys, GitHub tokens, private keys,
+# and so on). Installed as /etc/security-scan/gitleaks.toml only when that
+# file does not exist yet; edit the installed copy, not this one.
+
+[extend]
+useDefault = true
+
+# Custom rules. A useful one flags a private name, such as a local account
+# name that should never reach a published repository. Replace
+# your-private-name with the real value in the installed copy only, never in
+# a file you commit.
+#
+# [[rules]]
+# id = "private-local-identity"
+# description = "Private local name that published repos must not contain"
+# regex = '''(?i)your-private-name'''
+# tags = ["identity", "privacy", "local"]
+# keywords = ["your-private-name"]
+
+# Allowlists. Each entry should cover one known false positive and be scoped
+# as narrowly as gitleaks allows: to the rule it silences, to the file or
+# folder where it occurs, and where possible to the text on the matching line,
+# so that a real secret in the same place is still reported. When a new match
+# turns out to be a false positive, add an entry like these rather than
+# deleting a rule.
+#
+# Python byte-code caches are generated locally and never committed, but they
+# embed the absolute path of the source file, which a private-name rule
+# matches.
+#
+# [[allowlists]]
+# description = "Python byte-code caches"
+# paths = ['''(^|/)__pycache__/[^/]+\.pyc$''']
+#
+# A generic-api-key match on one known line in one known file:
+#
+# [[allowlists]]
+# description = "Public key field in Chrome extension manifests"
+# targetRules = ["generic-api-key"]
+# condition = "AND"
+# regexTarget = "line"
+# paths = ['''(^|/)chromium/extensions/[^/]+/manifest\.json$''']
+# regexes = ['''^\s*"key"\s*:\s*"''']

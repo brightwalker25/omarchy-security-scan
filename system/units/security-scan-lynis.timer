@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly system hardening audit (lynis)
+
+[Timer]
+Unit=security-scan@lynis.service
+OnCalendar=*-*-01 11:00:00
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

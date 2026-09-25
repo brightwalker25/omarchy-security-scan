@@ -1,0 +1,66 @@
+# AIDE file-integrity baseline for security-scan. Driven by
+# `security-scan aide`, which checks, explains changes against pacman,
+# then re-baselines. Edit here, not /etc/aide.conf (the package default).
+#
+# security-scan-install writes /etc/security-scan/aide.conf from the template
+# aide.conf.in, filling in the desktop user's home folder. The folder is
+# regex-escaped, since AIDE reads these paths as regular expressions. The
+# installed file is replaced on every install, so edit the template instead.
+
+database_in=file:/var/lib/aide/aide.db.gz
+database_out=file:/var/lib/aide/aide.db.new.gz
+gzip_dbout=yes
+report_level=list_entries
+report_url=stdout
+report_ignore_e2fsattrs=VNIE
+
+# Content hash plus ownership and permissions. No atime, no inode: btrfs
+# snapshots and balance renumber inodes, which would flood every report.
+Checks = p+u+g+s+m+c+acl+xattrs+sha256+ftype
+Dirs   = p+u+g+acl+xattrs+ftype
+
+# System: everything that runs as code or configures it. Directories get
+# the lighter rule: their size and mtime change whenever a file is added,
+# which the file itself already reports.
+/boot   d Dirs
+/usr    d Dirs
+/etc    d Dirs
+/opt    d Dirs
+/root   d Dirs
+/boot   Checks
+/usr    Checks
+/etc    Checks
+/opt    Checks
+/root   Checks
+
+# Userland persistence points. A rootkit that cannot get root settles for
+# these; they change rarely, so any change is worth a look.
+@HOME@/\.config/autostart           Checks
+@HOME@/\.config/systemd/user        Checks
+@HOME@/\.config/environment\.d      Checks
+@HOME@/\.config/fish/config\.fish   Checks
+@HOME@/\.bashrc                     Checks
+@HOME@/\.bash_profile               Checks
+@HOME@/\.profile                    Checks
+@HOME@/\.ssh                        Checks
+@HOME@/\.local/bin                  Checks
+
+# Churn that is not integrity: runtime state, caches, container layers.
+!/etc/mtab$
+!/etc/\.pwd\.lock$
+!/etc/pacman\.d/gnupg
+!/etc/NetworkManager/system-connections
+!/etc/cups/subscriptions\.conf
+!/etc/adjtime$
+!/etc/ld\.so\.cache$
+!/usr/lib/locale/locale-archive$
+!/usr/share/mime/
+!/usr/share/info/dir$
+!/usr/lib/gdk-pixbuf-2\.0/2\.10\.0/loaders\.cache$
+!/usr/share/icons/[^/]+/icon-theme\.cache$
+!/usr/share/glib-2\.0/schemas/gschemas\.compiled$
+!/usr/lib/gio/modules/giomodule\.cache$
+!/usr/lib/.*/__pycache__/
+!/opt/containerd
+!/root/\.cache
+!/opt/security-scan/tools/.*/__pycache__/

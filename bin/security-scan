@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+# Periodic security scans. Driven by security-scan@.service and the
+# security-scan-*.timer units; safe to run by hand for a one-off check.
+#
+#   security-scan arch-audit   known CVEs in installed packages
+#   security-scan gitleaks     secrets and private identifiers in SCAN_ROOT repos
+#   security-scan lynis        full system hardening audit
+#   security-scan aide         file-integrity check of system files
+#   security-scan rkhunter     rootkit and suspicious-file check
+#   security-scan models       malicious-pickle check of AI model files
+#
+# `security-report` reads the logs these write and grades them.
+
+set -uo pipefail
+
+MODE="${1:-}"
+case "$MODE" in
+  arch-audit | lynis | gitleaks | aide | rkhunter | models) ;;
+  *)
+    echo "usage: ${0##*/} <arch-audit|lynis|gitleaks|aide|rkhunter|models>" >&2
+    exit 2
+    ;;
+esac
+
+: "${SCAN_CONF:=/etc/security-scan/scan.conf}"
+: "${LOG_DIR:=/var/log/security-scan}"
+: "${GITLEAKS_CONFIG:=/etc/security-scan/gitleaks.toml}"
+: "${AIDE_CONFIG:=/etc/security-scan/aide.conf}"
+KEEP=12
+
+# Values set in the environment win over scan.conf, so a one-off run can
+# point somewhere else without editing the installed file.
+env_user=${DESKTOP_USER-}
+env_scan_root=${SCAN_ROOT-}
+env_model_roots=${MODEL_ROOTS-}
+
+# scan.conf is sourced into a script that runs as root. A copy that anyone
+# but root can write would let that user run code as root, so it is skipped.
+conf_error=""
+if [ -e "$SCAN_CONF" ]; then
+  if [ "$(id -u)" -eq 0 ] &&
+    { [ "$(stat -c %u "$SCAN_CONF")" != 0 ] || [ -n "$(find "$SCAN_CONF" -perm /022)" ]; }; then
+    conf_error="${SCAN_CONF} is not owned by root or is writable by others; ignored"
+  else
+    # shellcheck source=/dev/null
+    . "$SCAN_CONF"
+  fi
+fi
+
+DESKTOP_USER=${env_user:-${DESKTOP_USER:-}}
+user_home=""
+if [ -n "$DESKTOP_USER" ]; then
+  user_home=$(getent passwd "$DESKTOP_USER" | cut -d: -f6)
+fi
+SCAN_ROOT=${env_scan_root:-${SCAN_ROOT:-${user_home:+${user_home}/Work}}}
+MODEL_ROOTS=${env_model_roots:-${MODEL_ROOTS:-${user_home:+${user_home}/.cache/huggingface}}}
+
+# Guessing the desktop user (first uid over 1000, owner of a session) picks
+# the wrong account on a shared machine and would scan and notify the wrong
+# person. Stop instead, and leave a log that the report shows as an error.
+if [ -z "$DESKTOP_USER" ] || [ -z "$user_home" ]; then
+  install -d -m 0750 "$LOG_DIR"
+  LOG="$LOG_DIR/${MODE}-$(date +%Y%m%d-%H%M%S).log"
+  {
+    echo "=== ${MODE} run at $(date -Is) ==="
+    [ -n "$conf_error" ] && echo "!! ${conf_error}"
+    if [ -z "$DESKTOP_USER" ]; then
+      echo "!! DESKTOP_USER is not set. Set it in ${SCAN_CONF} or the environment."
+    else
+      echo "!! DESKTOP_USER=${DESKTOP_USER} is not a user on this system."
+    fi
+    echo "summary: error, desktop user not configured"
+  } >>"$LOG"
+  echo "${0##*/}: desktop user not configured, see ${LOG}" >&2
+  exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+  install -d -m 0750 -o root -g "$DESKTOP_USER" "$LOG_DIR"
+else
+  install -d -m 0750 "$LOG_DIR"
+fi
+LOG="$LOG_DIR/${MODE}-$(date +%Y%m%d-%H%M%S).log"
+
+log() { printf '%s\n' "$*" >>"$LOG"; }
+
+# Findings that only reach the journal are findings nobody reads, so speak to
+# the graphical session when there is one. Silently skipped on a headless boot;
+# the log is still written either way.
+notify() {
+  local urgency="$1" title="$2" body="$3" uid bus
+  uid=$(id -u "$DESKTOP_USER" 2>/dev/null) || return 0
+  bus="/run/user/${uid}/bus"
+  [ -S "$bus" ] || return 0
+  runuser -u "$DESKTOP_USER" -- \
+    env "DBUS_SESSION_BUS_ADDRESS=unix:path=${bus}" \
+    notify-send -a "Security scan" -u "$urgency" "$title" "$body" 2>/dev/null || true
+}
+
+# Keep the last $KEEP logs per mode. Left to the scanner rather than logrotate
+# so the whole thing stays in one file.
+prune() {
+  local old
+  old=$(ls -1t "$LOG_DIR/${MODE}-"*.log 2>/dev/null | tail -n +$((KEEP + 1)))
+  [ -n "$old" ] && printf '%s\n' "$old" | xargs -r rm -f
+  return 0
+}
+
+log "=== ${MODE} run at $(date -Is) ==="
+[ -n "$conf_error" ] && log "!! ${conf_error}"
+
+case "$MODE" in
+
+arch-audit)
+  # Needs the network to reach the Arch security tracker. Offline is a skip,
+  # not a finding: the timer is Persistent, so a missed run catches up.
+  if ! out=$(arch-audit --color=never 2>&1); then
+    log "arch-audit failed (offline?), skipping this run:"
+    log "$out"
+    # security-report ignores skipped runs, so the last real result stays in
+    # force and a long offline stretch shows up as a stale scan.
+    log "summary: skipped, offline"
+    prune
+    exit 0
+  fi
+  log "$out"
+
+  # --upgradable lists only what a pacman -Syu would actually fix.
+  fixable=$(arch-audit --quiet --upgradable --color=never 2>/dev/null | grep -c . || true)
+  total=$(printf '%s\n' "$out" | grep -c 'is affected by' || true)
+
+  log ""
+  log "summary: ${total} affected package(s), ${fixable} fixable by upgrade"
+
+  if [ "${fixable:-0}" -gt 0 ]; then
+    notify critical "Vulnerable packages: ${fixable} fixable" \
+      "${total} affected, ${fixable} fixed by an upgrade. Run: sudo pacman -Syu"
+  elif [ "${total:-0}" -gt 0 ]; then
+    notify normal "Vulnerable packages: ${total}" \
+      "No upstream fix available yet. See ${LOG}"
+  fi
+  ;;
+
+gitleaks)
+  # Working tree only. History is scanned by the pre-commit path and by an
+  # explicit --history run; a timer that re-reports long-published commits
+  # every week trains you to ignore it.
+  findings=0
+  repos=0
+  flagged=0
+  scanned=""
+
+  # gitleaks renamed its scan verbs at 8.19: "dir" replaced "detect --no-git".
+  # Pick whichever this build understands so a package upgrade can't quietly
+  # turn every run into a usage error.
+  if gitleaks dir --help >/dev/null 2>&1; then
+    gl_scan() { gitleaks dir "$1" "${@:2}"; }
+  else
+    gl_scan() { gitleaks detect --no-git --source "$1" "${@:2}"; }
+  fi
+
+  while IFS= read -r gitdir; do
+    repo=$(dirname "$gitdir")
+    repos=$((repos + 1))
+    report=$(mktemp)
+
+    gl_scan "$repo" \
+      --config "$GITLEAKS_CONFIG" \
+      --report-format json \
+      --report-path "$report" \
+      --redact \
+      --no-banner >>"$LOG" 2>&1
+    rc=$?
+
+    n=""
+    if [ -s "$report" ]; then
+      n=$(grep -c '"RuleID"' "$report" 2>/dev/null || true)
+    fi
+
+    n=${n:-0}
+
+    if [ "$rc" -gt 1 ]; then
+      log "!! gitleaks errored on ${repo} (exit ${rc})"
+    fi
+
+    if [ "$n" -gt 0 ]; then
+      findings=$((findings + n))
+      flagged=$((flagged + 1))
+      scanned="${scanned}${repo}: ${n}"$'\n'
+      log ""
+      log "--- ${repo}: ${n} finding(s) ---"
+      cat "$report" >>"$LOG"
+    fi
+    rm -f "$report"
+  done < <(find "$SCAN_ROOT" -maxdepth 3 -type d -name .git 2>/dev/null)
+
+  log ""
+  log "summary: ${findings} finding(s) across ${repos} repo(s)"
+
+  if [ "$findings" -gt 0 ]; then
+    notify critical "Secrets found in ${flagged} of ${repos} repo(s)" \
+      "${findings} finding(s). See ${LOG}"$'\n'"${scanned}"
+  fi
+  ;;
+
+lynis)
+  # --cronjob implies --quiet --no-colors and a non-interactive exit.
+  lynis audit system --cronjob >>"$LOG" 2>&1
+
+  report=/var/log/lynis-report.dat
+  if [ -r "$report" ]; then
+    # lynis writes its report 0640 root:root; re-lay it down so the desktop
+    # user can read its own audit without sudo.
+    if [ "$(id -u)" -eq 0 ]; then
+      install -m 0640 -g "$DESKTOP_USER" "$report" "${LOG%.log}-report.dat"
+    else
+      cp -f "$report" "${LOG%.log}-report.dat"
+    fi
+    index=$(awk -F= '/^hardening_index=/{print $2}' "$report" | tail -1)
+    warnings=$(grep -c '^warning\[\]=' "$report" || true)
+    suggestions=$(grep -c '^suggestion\[\]=' "$report" || true)
+
+    log ""
+    log "summary: hardening index ${index:-?}, ${warnings} warning(s), ${suggestions} suggestion(s)"
+    log ""
+    log "--- warnings ---"
+    grep '^warning\[\]=' "$report" >>"$LOG" 2>/dev/null
+
+    if [ "${warnings:-0}" -gt 0 ]; then
+      notify normal "Lynis: ${warnings} warning(s)" \
+        "Hardening index ${index:-?}/100. See ${LOG}"
+    fi
+  else
+    log "lynis produced no report at ${report}"
+  fi
+  ;;
+
+aide)
+  # Check against the baseline, explain each change, then re-baseline so the
+  # next run only reports what is new. The previous baseline is kept as
+  # aide.db.prev.gz; the log keeps every finding for the weekly report.
+  db=/var/lib/aide/aide.db.gz
+  # aide is in the AUR only, so the installer cannot add it as root. Report
+  # its absence as an error rather than as a clean run.
+  if ! command -v aide >/dev/null 2>&1; then
+    log "aide is not installed. Install it from the AUR, for example: yay -S aide"
+    log "summary: error, aide not installed"
+    prune
+    exit 0
+  fi
+  if [ ! -s "$db" ]; then
+    log "no baseline at ${db}; creating one, nothing to compare this run"
+    aide --init --no-progress --no-color -c "$AIDE_CONFIG" >/dev/null 2>>"$LOG" &&
+      mv -f /var/lib/aide/aide.db.new.gz "$db"
+    log "summary: baseline created"
+    prune
+    exit 0
+  fi
+
+  out=$(aide --update --no-progress --no-color -c "$AIDE_CONFIG" 2>&1)
+  rc=$?
+  # Exit codes 1, 2 and 4 are bits for added, removed and changed entries;
+  # 14 and up are real errors.
+  if [ "$rc" -ge 14 ]; then
+    log "!! aide failed (exit ${rc}):"
+    log "$out"
+    log "summary: error"
+    notify critical "File integrity check failed" "aide exit ${rc}. See ${LOG}"
+    prune
+    exit 0
+  fi
+
+  # Package updates are the normal reason a system file changes. A file that
+  # pacman owns and still verifies byte-for-byte is explained; anything else
+  # under a code path is not. Changed config and user persistence files are
+  # listed for a human to confirm.
+  last_run=$(stat -c %Y "$db" 2>/dev/null || echo 0)
+  pacman_since=$(awk -v t="$(date -d "@${last_run}" '+%Y-%m-%dT%H:%M:%S')" \
+    '/\[ALPM\] (upgraded|installed|removed)/ { ts=substr($1,2,19); if (ts >= t) n++ } END { print n+0 }' \
+    /var/log/pacman.log 2>/dev/null)
+
+  declare -A pkg_bad=()
+  pkg_checked() {
+    local pkg="$1"
+    if [ -z "${pkg_bad[$pkg]+x}" ]; then
+      # Content, size, link and ownership mismatches only. A bare mtime
+      # mismatch is common and harmless.
+      pkg_bad[$pkg]=$(pacman -Qkk "$pkg" 2>&1 | grep -E '^(warning|error):' |
+        grep -E 'checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch|UID mismatch|GID mismatch' || true)
+    fi
+  }
+
+  # Caches that a pacman hook rebuilds whenever a package adds to them. No
+  # package owns them, so a change is explained only when pacman.log shows
+  # the matching hook running in the minute before the file was written.
+  rebuild_hook() {
+    case "$1" in
+      /usr/share/applications/mimeinfo.cache) echo update-desktop-database.hook ;;
+      /usr/lib/gtk-3.0/3.0.0/immodules.cache) echo gtk-query-immodules-3.0.hook ;;
+      /usr/lib/gtk-4.0/4.0.0/*/giomodule.cache) echo gtk4-querymodules.hook ;;
+    esac
+  }
+  hook_wrote() {
+    local hook="$1" mtime ts t
+    mtime=$(stat -c %Y "$2" 2>/dev/null) || return 1
+    while IFS= read -r ts; do
+      t=$(date -d "$ts" +%s 2>/dev/null) || continue
+      [ "$mtime" -ge "$t" ] && [ "$mtime" -le $((t + 60)) ] && return 0
+    done < <(grep -F "running '${hook}'" /var/log/pacman.log 2>/dev/null |
+      sed -n 's/^\[\([^]]*\)\].*/\1/p' | tail -n 50)
+    return 1
+  }
+
+  # Package files that a local pacman hook deliberately rewrites. A browser's
+  # policies.json gets telemetry and studies switched off after every browser
+  # update, so it always fails pacman's checksum. It is explained only while
+  # the hook is installed and the file holds nothing but the browser's own policies
+  # and those two switches; any other policy (an extension, a proxy, a
+  # certificate) leaves it red. security-report holds the same check, for
+  # RED lines logged before this one existed; change both together.
+  hook_rewrote() {
+    case "$1" in
+      /opt/zen-browser-bin/distribution/policies.json)
+        [ -x /usr/local/lib/zen-privacy-policy ] &&
+          [ -f /etc/pacman.d/hooks/zen-privacy-policy.hook ] &&
+          python3 -I -c '
+import json, sys
+p = json.load(open(sys.argv[1])).get("policies")
+allowed = {"DisableAppUpdate", "DefaultSerialGuardSetting", "DisableTelemetry", "DisableFirefoxStudies"}
+ok = (isinstance(p, dict) and set(p) <= allowed
+      and p.get("DisableTelemetry") is True and p.get("DisableFirefoxStudies") is True)
+sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
+    esac
+  }
+
+  red=0 amber=0 pkg=0
+  while IFS= read -r line; do
+    path="${line#*: }"
+    kind="${line%%:*}"
+    case "$kind" in
+      f++*|d++*|l++*) what=added ;;
+      f--*|d--*|l--*) what=removed ;;
+      *) what=changed ;;
+    esac
+
+    # A directory only changes or appears because of what is in it, and
+    # those files are reported on their own.
+    [ -d "$path" ] && [ "$what" != removed ] && continue
+
+    owner=$(pacman -Qqo "$path" 2>/dev/null | head -1)
+    verdict=""
+    if [ -n "$owner" ] && [ "$what" != removed ]; then
+      pkg_checked "$owner"
+      if printf '%s\n' "${pkg_bad[$owner]}" | grep -qF " ${path} " &&
+        hook=$(hook_rewrote "$path") && [ -n "$hook" ]; then
+        verdict="PKG ${what} ${path} (${owner}, privacy switches added by the ${hook} hook)"
+      elif printf '%s\n' "${pkg_bad[$owner]}" | grep -qF " ${path} "; then
+        verdict="RED ${what} ${path} (owned by ${owner} but fails pacman's checksum)"
+      elif pacman -Qii "$owner" 2>/dev/null |
+        awk -v p="$path" '($1 == "MODIFIED" || $1 == "UNMODIFIED") && $2 == p { f = 1 } END { exit !f }'; then
+        verdict="AMBER ${what} ${path} (config file of ${owner}, edited locally)"
+      else
+        verdict="PKG ${what} ${path} (${owner}, verified by pacman)"
+      fi
+    elif [ -z "$owner" ] && [ "$what" = removed ]; then
+      verdict="AMBER ${what} ${path} (unpackaged file removed)"
+    elif [ "$what" = removed ]; then
+      verdict="PKG ${what} ${path} (${owner}, removed by package change)"
+    elif hook=$(rebuild_hook "$path") && [ -n "$hook" ] && hook_wrote "$hook" "$path"; then
+      verdict="PKG ${what} ${path} (rebuilt by pacman's ${hook%.hook} hook)"
+    else
+      case "$path" in
+        /boot/*)
+          if [ "${pacman_since:-0}" -gt 0 ]; then
+            verdict="PKG ${what} ${path} (boot image rebuilt after a package update)"
+          else
+            verdict="RED ${what} ${path} (boot file changed with no package update)"
+          fi
+          ;;
+        /usr/local/* | /opt/* | /etc/* | /root/* | /home/*)
+          verdict="AMBER ${what} ${path} (not from a package, confirm it was you)"
+          ;;
+        *)
+          verdict="RED ${what} ${path} (unpackaged file in a system code path)"
+          ;;
+      esac
+    fi
+
+    case "$verdict" in
+      RED*) red=$((red + 1)) ;;
+      AMBER*) amber=$((amber + 1)) ;;
+      PKG*) pkg=$((pkg + 1)) ;;
+    esac
+    log "$verdict"
+  done < <(printf '%s\n' "$out" | grep -E '^[fdlbcps][^:]*: /')
+
+  if [ -s /var/lib/aide/aide.db.new.gz ]; then
+    cp -f "$db" /var/lib/aide/aide.db.prev.gz
+    mv -f /var/lib/aide/aide.db.new.gz "$db"
+  fi
+
+  log ""
+  log "summary: ${red} unexplained, ${amber} to confirm, ${pkg} from package updates"
+
+  if [ "$red" -gt 0 ]; then
+    notify critical "File integrity: ${red} unexplained change(s)" \
+      "System files changed outside any package update. See ${LOG}"
+  fi
+  ;;
+
+rkhunter)
+  # rkhunter's own greps trip GNU grep's obsolescence warnings; drop those.
+  out=$(rkhunter --check --sk --nocolors --rwo 2>&1 | grep -v -E '^(e?grep|fgrep): warning')
+  log "$out"
+
+  # rkhunter has no pacman support, so after an upgrade it reports every new
+  # binary as "file properties changed". Accept those only when pacman
+  # verifies the file byte-for-byte, then re-record the properties.
+  accepted=0 open=0
+  changed=$(printf '%s\n' "$out" | awk '/file properties have changed/{f=1; next} /^Warning:/{f=0} f && /File: /{print $2}')
+  unverified=""
+  for f in $changed; do
+    owner=$(pacman -Qqo "$f" 2>/dev/null | head -1)
+    if [ -n "$owner" ] && ! pacman -Qkk "$owner" 2>&1 |
+      grep -E 'checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch|UID mismatch|GID mismatch' |
+      grep -qF " ${f} "; then
+      accepted=$((accepted + 1))
+    else
+      unverified="${unverified}${f} "
+    fi
+  done
+
+  warnings=$(printf '%s\n' "$out" | grep -c '^Warning:' || true)
+  props=$(printf '%s\n' "$out" | grep -c 'file properties have changed' || true)
+  # One "properties changed" warning covers every changed file in it.
+  if [ -n "$changed" ] && [ -z "$unverified" ]; then
+    open=$((warnings - props))
+    rkhunter --propupd --nocolors >/dev/null 2>&1
+  else
+    open=$warnings
+  fi
+
+  log ""
+  for f in $unverified; do log "UNVERIFIED ${f}"; done
+  log "summary: ${open} warning(s), ${accepted} changed file(s) verified by pacman"
+
+  if [ "$open" -gt 0 ]; then
+    notify critical "Rootkit check: ${open} warning(s)" "See ${LOG}"
+  fi
+  ;;
+
+models)
+  # safetensors and GGUF are data only. Pickle-based formats (.ckpt .pt .pth
+  # .bin .pkl) can run code when loaded, which is what picklescan looks for.
+  dangerous=0 suspicious=0 scanned=0 pickles=0 failed=0
+  SKIP_DIRS='(\.venv|venv|site-packages|node_modules|\.git)$'
+  for root in $MODEL_ROOTS; do
+    [ -d "$root" ] || continue
+    # Python environments hold library test fixtures, not models, and flood
+    # the scan with parse warnings. Supply-chain risk in pip packages is a
+    # different problem this scan does not claim to cover.
+    out=$(picklescan -p "$root" --exclude-dir "$SKIP_DIRS" 2>&1)
+    log "--- ${root} ---"
+    log "$out"
+    # A crash mid-scan prints a traceback and no summary. That is a failed
+    # scan, not a clean one.
+    if ! printf '%s\n' "$out" | grep -q '^Scanned files'; then
+      log "!! picklescan did not finish on ${root}"
+      failed=$((failed + 1))
+      continue
+    fi
+    scanned=$((scanned + $(printf '%s\n' "$out" | awk -F': ' '/^Scanned files/{print $2+0}')))
+    dangerous=$((dangerous + $(printf '%s\n' "$out" | awk -F': ' '/^Dangerous globals/{print $2+0}')))
+    suspicious=$((suspicious + $(printf '%s\n' "$out" | awk -F': ' '/^Suspicious globals/{print $2+0}')))
+    pickles=$((pickles + $(find -L "$root" -type d -regextype posix-extended -regex ".*/${SKIP_DIRS}" -prune -o \
+      -type f \( -iname '*.ckpt' -o -iname '*.pt' -o -iname '*.pth' -o -iname '*.bin' -o -iname '*.pkl' -o -iname '*.pickle' \) -print 2>/dev/null | wc -l)))
+  done
+
+  log ""
+  if [ "$failed" -gt 0 ]; then
+    log "summary: error, ${failed} folder(s) not scanned"
+    notify critical "Model scan failed" "picklescan did not finish. See ${LOG}"
+  else
+    log "summary: ${dangerous} dangerous, ${suspicious} suspicious, ${scanned} file(s) scanned, ${pickles} pickle-format file(s)"
+  fi
+
+  if [ "$dangerous" -gt 0 ]; then
+    notify critical "Malicious model file found" \
+      "${dangerous} dangerous import(s). Do not load it. See ${LOG}"
+  elif [ "$suspicious" -gt 0 ]; then
+    notify normal "Model scan: ${suspicious} suspicious import(s)" "See ${LOG}"
+  fi
+  ;;
+
+esac
+
+prune
+log "=== done at $(date -Is) ==="
+exit 0

@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# Installer for the periodic security scans and the weekly report.
+# Idempotent: safe to re-run after pulling a new version of this repo.
+#
+#   sudo bin/security-scan-install              install or update
+#   sudo bin/security-scan-install --uninstall  remove units and programs
+#   bin/security-scan-install --dry-run         print every action, change nothing
+#
+# The desktop user is the account that ran sudo. Pass --user NAME to choose
+# another one, or when running from a root shell.
+
+set -euo pipefail
+
+usage() {
+  echo "usage: ${0##*/} [--dry-run] [--uninstall] [--user NAME]" >&2
+  exit 2
+}
+
+DRY=0
+UNINSTALL=0
+TARGET_USER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --user)
+      [ $# -ge 2 ] || usage
+      TARGET_USER="$2"
+      shift
+      ;;
+    --user=*) TARGET_USER="${1#--user=}" ;;
+    -h | --help) usage ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+DATE=$(date +%Y%m%d)
+TOOL_DIR=/opt/security-scan/tools
+ETC=/etc/security-scan
+TIMERS=(arch-audit aide gitleaks lynis models rkhunter)
+NOTES=()
+
+# A dry run only reads, so it is allowed without root. That makes it possible
+# to check what the installer would do before handing it root.
+if [ "$(id -u)" -ne 0 ]; then
+  if [ "$DRY" -eq 1 ]; then
+    echo "note: dry run without root; files only root can read are reported as missing"
+  else
+    echo "run me with sudo (or use --dry-run to see what I would do)" >&2
+    exit 1
+  fi
+fi
+
+# Every change goes through run, so that --dry-run shows the full list of
+# commands and a real run shows what it did.
+run() {
+  printf '  %s\n' "$*"
+  [ "$DRY" -eq 1 ] || "$@"
+}
+
+say() { printf '==> %s\n' "$*"; }
+
+# Write stdin to a root-owned file. Rendering to a temporary file first means
+# a failed render never leaves a half-written config in /etc.
+put() {
+  local dest="$1" mode="$2" tmp
+  printf '  write %s (mode %s)\n' "$dest" "$mode"
+  if [ "$DRY" -eq 1 ]; then
+    cat >/dev/null
+    return 0
+  fi
+  tmp=$(mktemp)
+  cat >"$tmp"
+  install -D -o root -g root -m "$mode" "$tmp" "$dest"
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Desktop user
+# ---------------------------------------------------------------------------
+
+if [ -z "$TARGET_USER" ]; then
+  TARGET_USER=${SUDO_USER:-}
+  if [ -z "$TARGET_USER" ] && [ "$DRY" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    TARGET_USER=$(id -un)
+  fi
+fi
+if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = root ]; then
+  echo "cannot tell which account is the desktop user; run with sudo from that account, or pass --user NAME" >&2
+  exit 1
+fi
+if ! entry=$(getent passwd "$TARGET_USER"); then
+  echo "no such user: ${TARGET_USER}" >&2
+  exit 1
+fi
+TARGET_UID=$(printf '%s' "$entry" | cut -d: -f3)
+TARGET_HOME=$(printf '%s' "$entry" | cut -d: -f6)
+
+# Both values end up inside double quotes in a file root sources, so anything
+# that could break out of the quotes is refused rather than escaped.
+case "${TARGET_USER}${TARGET_HOME}" in
+  *[\"\$\`\\]* | *[[:space:]]*)
+    echo "user name or home folder contains characters this installer does not handle: ${TARGET_USER} ${TARGET_HOME}" >&2
+    exit 1
+    ;;
+esac
+
+BUS="/run/user/${TARGET_UID}/bus"
+as_user() {
+  run runuser -u "$TARGET_USER" -- env \
+    "XDG_RUNTIME_DIR=/run/user/${TARGET_UID}" \
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=${BUS}" "$@"
+}
+
+say "desktop user: ${TARGET_USER} (${TARGET_HOME})"
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+if [ "$UNINSTALL" -eq 1 ]; then
+  say "stopping and disabling timers"
+  for t in "${TIMERS[@]}"; do
+    if [ -e "/etc/systemd/system/security-scan-${t}.timer" ]; then
+      run systemctl disable --now "security-scan-${t}.timer"
+    fi
+  done
+  if [ -e /etc/systemd/user/security-report.timer ]; then
+    run systemctl --global disable security-report.timer
+    if [ -S "$BUS" ]; then
+      as_user systemctl --user stop security-report.timer
+    fi
+  fi
+
+  say "removing units"
+  for f in /etc/systemd/system/security-scan@.service \
+    /etc/systemd/system/security-scan-*.timer \
+    /etc/systemd/user/security-report.service \
+    /etc/systemd/user/security-report.timer; do
+    if [ -e "$f" ]; then run rm -f "$f"; fi
+  done
+  run systemctl daemon-reload
+  if [ -S "$BUS" ]; then
+    as_user systemctl --user daemon-reload
+  fi
+
+  say "removing programs"
+  for f in /usr/local/bin/security-scan /usr/local/bin/security-report; do
+    if [ -e "$f" ] || [ -L "$f" ]; then run rm -f "$f"; fi
+  done
+  # Only remove the picklescan shim if it is the one this installer made.
+  if [ -L /usr/local/bin/picklescan ] &&
+    [[ "$(readlink /usr/local/bin/picklescan)" == /opt/security-scan/* ]]; then
+    run rm -f /usr/local/bin/picklescan
+  fi
+  if [ -d /opt/security-scan ]; then run rm -rf /opt/security-scan; fi
+
+  echo
+  echo "Left in place, because they hold your settings, history and baselines:"
+  echo "  ${ETC}                 configuration and risk register"
+  echo "  /etc/rkhunter.conf.local           rkhunter overrides"
+  echo "  /var/log/security-scan             scan logs"
+  echo "  /var/lib/aide                      AIDE baseline"
+  echo "  ${TARGET_HOME}/.local/share/security-report   weekly HTML reports"
+  echo "Delete them by hand if you no longer want them, for example:"
+  echo "  sudo rm -r ${ETC} /var/log/security-scan /var/lib/aide"
+  echo "The packages (arch-audit, lynis, gitleaks, rkhunter, aide) were not removed."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+
+say "installing packages"
+run pacman -S --needed --noconfirm arch-audit lynis gitleaks rkhunter python
+
+# aide is only in the AUR, and AUR helpers must not build as root. The scans
+# still install; security-scan aide logs "aide not installed" until it is.
+HAVE_AIDE=0
+if command -v aide >/dev/null 2>&1; then
+  HAVE_AIDE=1
+else
+  echo "  aide is not installed (AUR only). As ${TARGET_USER}, run: yay -S aide"
+  NOTES+=("aide is not installed. As ${TARGET_USER}, run: yay -S aide, then re-run this installer.")
+fi
+
+# picklescan is not packaged for Arch. It goes in its own root-owned tool
+# folder, not in a user's ~/.local, because it runs as root. numpy is needed
+# to read the numpy arrays that many model files embed.
+say "installing picklescan"
+if command -v uv >/dev/null 2>&1; then
+  run env UV_TOOL_DIR="$TOOL_DIR" UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_PREFERENCE=only-system \
+    uv tool install --upgrade picklescan --with numpy
+else
+  echo "  uv is not installed, so picklescan was skipped. Install it with: sudo pacman -S uv"
+  NOTES+=("uv is not installed: run sudo pacman -S uv, then re-run this installer so the models scan works.")
+fi
+
+# ---------------------------------------------------------------------------
+# Programs
+# ---------------------------------------------------------------------------
+
+# Copied, never symlinked. Both run as root, and a symlink into this checkout
+# would let anyone who can write the checkout (the desktop user) run code as
+# root. Updating the repo therefore changes nothing until this is re-run.
+say "installing programs"
+for prog in security-scan security-report; do
+  if [ -L "/usr/local/bin/${prog}" ]; then
+    run rm -f "/usr/local/bin/${prog}"
+  fi
+  run install -D -o root -g root -m 0755 "$SRC/bin/${prog}" "/usr/local/bin/${prog}"
+done
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+say "installing configuration in ${ETC}"
+run install -d -o root -g root -m 0755 "$ETC"
+
+# AIDE reads its selection lines as regular expressions, so the home folder
+# must be escaped before it goes into the pattern.
+regex_escape() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|]/\\&/g'; }
+HOME_RE=$(regex_escape "$TARGET_HOME")
+
+if [ -e "$ETC/scan.conf" ]; then
+  echo "  keep ${ETC}/scan.conf (exists)"
+else
+  conf=$(<"$SRC/system/scan.conf.example")
+  conf=${conf//@USER@/"$TARGET_USER"}
+  conf=${conf//@HOME@/"$TARGET_HOME"}
+  printf '%s\n' "$conf" | put "$ETC/scan.conf" 0644
+fi
+
+# aide.conf is generated from the template, so it is replaced on every run.
+# A copy that differs is kept in case it was edited by hand.
+aide_conf=$(<"$SRC/system/aide.conf.in")
+aide_conf=${aide_conf//@HOME@/"$HOME_RE"}
+if [ -e "$ETC/aide.conf" ] && ! printf '%s\n' "$aide_conf" | cmp -s - "$ETC/aide.conf"; then
+  run cp -p "$ETC/aide.conf" "$ETC/aide.conf.bak-${DATE}"
+fi
+printf '%s\n' "$aide_conf" | put "$ETC/aide.conf" 0644
+
+# These two hold the user's own rules and assessments. Never overwrite them.
+install_once() {
+  local src="$1" dest="$2" mode="$3"
+  if [ -e "$dest" ]; then
+    echo "  keep ${dest} (exists)"
+  else
+    run install -D -o root -g root -m "$mode" "$src" "$dest"
+  fi
+}
+install_once "$SRC/system/gitleaks.example.toml" "$ETC/gitleaks.toml" 0644
+install_once "$SRC/system/risk-register.example.toml" "$ETC/risk-register.toml" 0644
+install_once "$SRC/system/rkhunter.conf.local.example" /etc/rkhunter.conf.local 0640
+
+# ---------------------------------------------------------------------------
+# Units
+# ---------------------------------------------------------------------------
+
+say "installing system units"
+for f in "$SRC"/system/units/*; do
+  run install -D -o root -g root -m 0644 "$f" "/etc/systemd/system/$(basename "$f")"
+done
+run systemctl daemon-reload
+for t in "${TIMERS[@]}"; do
+  run systemctl enable --now "security-scan-${t}.timer"
+done
+
+# The weekly report runs as the desktop user, so its units are user units.
+# Installed for all users in /etc/systemd/user so that no copy lives in a
+# home folder where it could drift from the repo.
+say "installing user units"
+for f in "$SRC"/system/user/*; do
+  run install -D -o root -g root -m 0644 "$f" "/etc/systemd/user/$(basename "$f")"
+done
+run systemctl --global enable security-report.timer
+if [ -S "$BUS" ]; then
+  as_user systemctl --user daemon-reload
+  as_user systemctl --user start security-report.timer
+else
+  echo "  no session bus for ${TARGET_USER}; the timer starts at the next login"
+fi
+
+# A copy in ~/.config/systemd/user takes precedence over /etc/systemd/user,
+# so an old hand-installed copy would hide every future update. The user's
+# files are theirs to delete, so this only reports them.
+dups=()
+for f in security-report.service security-report.timer timers.target.wants/security-report.timer; do
+  p="${TARGET_HOME}/.config/systemd/user/${f}"
+  if [ -e "$p" ] || [ -L "$p" ]; then dups+=("$p"); fi
+done
+if [ "${#dups[@]}" -gt 0 ]; then
+  echo "  found older per-user copies that override the installed units:"
+  printf '    %s\n' "${dups[@]}"
+  NOTES+=("Remove the older per-user report units, as ${TARGET_USER}: rm ${dups[*]}; systemctl --user daemon-reload; systemctl --user restart security-report.timer")
+fi
+
+# ---------------------------------------------------------------------------
+# Baselines
+# ---------------------------------------------------------------------------
+
+say "baselines"
+# Both baselines live in folders only root can list, so a dry run without
+# root cannot tell whether they exist.
+can_see() { [ -x "$(dirname "$1")" ]; }
+
+# security-scan aide creates the baseline itself on its first run.
+if [ "$HAVE_AIDE" -eq 1 ]; then
+  if ! can_see /var/lib/aide/aide.db.gz; then
+    echo "  cannot see the AIDE baseline without root; a real run starts the first scan if it is missing"
+  elif [ -s /var/lib/aide/aide.db.gz ]; then
+    echo "  keep AIDE baseline (exists)"
+  else
+    run systemctl start --no-block security-scan@aide.service
+  fi
+fi
+# rkhunter needs a record of file properties before its first check, or every
+# file shows as changed.
+if ! can_see /var/lib/rkhunter/db/rkhunter.dat; then
+  echo "  cannot see the rkhunter baseline without root; a real run creates it if missing"
+elif [ -e /var/lib/rkhunter/db/rkhunter.dat ]; then
+  echo "  keep rkhunter baseline (exists)"
+else
+  run rkhunter --propupd --nocolors
+fi
+
+# ---------------------------------------------------------------------------
+
+echo
+systemctl list-timers 'security-scan-*' --no-pager || true
+if [ -S "$BUS" ]; then
+  if [ "$(id -u)" -eq "$TARGET_UID" ]; then
+    systemctl --user list-timers security-report.timer --no-pager 2>/dev/null || true
+  else
+    runuser -u "$TARGET_USER" -- env "XDG_RUNTIME_DIR=/run/user/${TARGET_UID}" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=${BUS}" \
+      systemctl --user list-timers security-report.timer --no-pager 2>/dev/null || true
+  fi
+fi
+
+if [ "${#NOTES[@]}" -gt 0 ]; then
+  echo
+  echo "Still to do by hand:"
+  printf '  - %s\n' "${NOTES[@]}"
+fi
+echo
+echo "done. logs in /var/log/security-scan (readable by ${TARGET_USER})"

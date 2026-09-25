@@ -1,0 +1,19 @@
+# Settings for security-scan, installed as /etc/security-scan/scan.conf.
+#
+# This file is sourced by a script that runs as root, so it must be owned by
+# root and not writable by anyone else; security-scan ignores it otherwise.
+# The installer fills in @USER@ and @HOME@ from the account that ran sudo.
+# A variable set in the environment overrides the value here for that run.
+
+# The account that receives desktop notifications and may read the logs in
+# /var/log/security-scan. The scans refuse to run without it rather than
+# guess, because a guess could notify the wrong person.
+DESKTOP_USER="@USER@"
+
+# gitleaks scans every git repository at most two levels below this folder.
+SCAN_ROOT="@HOME@/Work"
+
+# Folders searched for pickle-format AI model files, separated by spaces.
+# Folders that do not exist are skipped, so it is safe to list ones you may
+# create later.
+MODEL_ROOTS="@HOME@/AI @HOME@/.cache/huggingface"

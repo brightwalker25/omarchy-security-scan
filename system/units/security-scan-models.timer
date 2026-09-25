@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily malicious-pickle check of AI model files (picklescan)
+
+[Timer]
+Unit=security-scan@models.service
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

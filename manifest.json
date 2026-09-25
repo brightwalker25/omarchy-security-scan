@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "id": "brightwalker25.security-scan",
+  "name": "Security Scan",
+  "version": "0.2.1",
+  "author": "brightwalker25",
+  "license": "MIT",
+  "description": "The weekly security report in the bar: scan health, known vulnerabilities, file integrity, rootkits, leaked secrets and privacy, graded red, amber or green",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Security Scan",
+    "description": "A lock in the bar tinted green, amber or red to match the weekly security report, and every section with what is being done about each finding in the panel",
+    "category": "System",
+    "aliases": [
+      "security",
+      "security-scan",
+      "report",
+      "rootkit",
+      "rkhunter",
+      "aide",
+      "integrity",
+      "cve",
+      "vulnerability",
+      "gitleaks",
+      "lynis"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalMs": 300000,
+      "hideWhenGreen": false
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalMs",
+        "type": "integer",
+        "label": "Re-read the report every (ms)",
+        "min": 30000,
+        "max": 3600000,
+        "step": 30000,
+        "defaultValue": 300000,
+        "description": "How often the bar re-reads the report. This only reads stored scan results, so it is cheap. The scans themselves run on their own schedule."
+      },
+      {
+        "key": "hideWhenGreen",
+        "type": "boolean",
+        "label": "Hide the icon when green",
+        "defaultValue": false,
+        "description": "Only show the lock when something is amber or red, or when the report cannot be read."
+      }
+    ]
+  }
+}

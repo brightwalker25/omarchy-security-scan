@@ -1,0 +1,30 @@
+# Local overrides for rkhunter, driven by `security-scan rkhunter`.
+# Installed as /etc/rkhunter.conf.local only when that file does not exist.
+# The entries below are true of a stock Arch install. Check any new entry by
+# hand, for example with pacman -Qkk, before allowing it.
+
+# Arch ships these as scripts, not binaries: egrep/fgrep from grep, ldd from
+# glibc. pacman -Qkk shows them unaltered.
+SCRIPTWHITELIST=/usr/bin/egrep
+SCRIPTWHITELIST=/usr/bin/fgrep
+SCRIPTWHITELIST=/usr/bin/ldd
+
+# Dotfile man pages shipped by krb5 (verified with pacman -Qkk), and the stamp
+# systemd-update-done writes for ConditionNeedsUpdate.
+ALLOWHIDDENFILE=/usr/share/man/man5/.k5identity.5.gz
+ALLOWHIDDENFILE=/usr/share/man/man5/.k5login.5.gz
+ALLOWHIDDENFILE=/etc/.updated
+
+# An example of allowing one process rather than raising a limit for
+# everything: Cryptomator's JVM holds a 1 MB shared-memory segment, exactly at
+# the default limit. Uncomment if you use it.
+#ALLOWIPCPROC=/opt/cryptomator/bin/cryptomator
+
+# For an sshd that is disabled or has no custom config: accept the compiled-in
+# defaults (no root password login, protocol 2 only on any recent OpenSSH).
+ALLOW_SSH_ROOT_USER=unset
+ALLOW_SSH_PROT_V1=2
+
+# rkhunter has no pacman support (PKGMGR knows only RPM, DPKG, BSD, SOLARIS).
+# `security-scan rkhunter` instead verifies changed files with pacman -Qkk and
+# re-records properties only when pacman vouches for them.
