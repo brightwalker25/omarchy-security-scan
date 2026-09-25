@@ -354,10 +354,10 @@ rest from the official repositories; see
 
 ## Written with AI help
 
-Yes, an AI helped write this. No, it is not Skynet, and I have checked the
-code to make sure it is not plotting Judgment Day. If that still puts you off,
-no hard feelings. The whole point of Linux is that you decide what runs on
-your computer.
+Yes, an AI helped write this. No, it is not Skynet. Or is it? Either way, I
+have checked the code to make sure it is not plotting Judgment Day. If that
+still puts you off, no hard feelings. The whole point of Linux is that you
+decide what runs on your computer.
 
 ## Licence
 
