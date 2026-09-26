@@ -4,6 +4,20 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 [semantic versioning](https://semver.org), and the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - 2026-09-26
+
+### Security
+
+- The installer no longer runs `uv tool install --upgrade picklescan --with
+  numpy` as root, which fetched whatever versions PyPI served on the day.
+  picklescan and numpy are now pinned to exact versions and SHA-256 hashes in
+  `system/picklescan-requirements.txt`, and installed as root with
+  `--require-hashes` and `--only-binary :all:` into a virtual environment in
+  `/opt/security-scan/picklescan`. Any file whose hash is not listed is
+  refused, and nothing is built from source. Upgrades now happen only by
+  changing that file in a new commit. The old uv tool folder,
+  `/opt/security-scan/tools`, is removed.
+
 ## [0.2.1] - 2026-09-25
 
 ### Changed

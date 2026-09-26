@@ -344,7 +344,10 @@ widget is set to. The scan settings live in `/etc/security-scan`; see
 ## Requirements
 
 Arch Linux or Omarchy with systemd, the Omarchy shell for the widget, `uv` for
-installing `picklescan`, and an AUR helper for AIDE. The installer adds the
+installing `picklescan`, and an AUR helper for AIDE. `picklescan` and `numpy`
+come from PyPI, pinned to the exact versions and SHA-256 hashes in
+`system/picklescan-requirements.txt`, so what runs as root is fixed by the
+commit you install from. The installer adds the
 rest from the official repositories; see
 [INSTALL.md](INSTALL.md#requirements).
 

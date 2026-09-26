@@ -37,7 +37,8 @@ done
 
 SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 DATE=$(date +%Y%m%d)
-TOOL_DIR=/opt/security-scan/tools
+PICKLE_VENV=/opt/security-scan/picklescan
+PICKLE_REQS="$SRC/system/picklescan-requirements.txt"
 ETC=/etc/security-scan
 TIMERS=(arch-audit aide gitleaks lynis models rkhunter)
 NOTES=()
@@ -187,14 +188,42 @@ else
   NOTES+=("aide is not installed. As ${TARGET_USER}, run: yay -S aide, then re-run this installer.")
 fi
 
-# picklescan is not packaged for Arch. It goes in its own root-owned tool
-# folder, not in a user's ~/.local, because it runs as root. numpy is needed
-# to read the numpy arrays that many model files embed.
+# picklescan is not packaged for Arch. It goes in its own root-owned virtual
+# environment, not in a user's ~/.local, because it runs as root. numpy is
+# needed to read the headers of .npy files.
+#
+# Everything installed here runs as root, so it is pinned to the exact
+# versions and SHA-256 hashes in system/picklescan-requirements.txt. uv
+# refuses any file whose hash is not listed, and --only-binary means no
+# package is built, so no build step runs as root either. Upgrading means
+# changing that file in a new commit; this installer never upgrades on its
+# own. uv pip sync makes the environment match the file exactly, removing
+# anything not listed. The environment is only recreated when it is missing or
+# was made for another Python, so that re-running the installer does not
+# rewrite every file under AIDE's watch.
 say "installing picklescan"
 if command -v uv >/dev/null 2>&1; then
-  run env UV_TOOL_DIR="$TOOL_DIR" UV_TOOL_BIN_DIR=/usr/local/bin \
-    UV_PYTHON_PREFERENCE=only-system \
-    uv tool install --upgrade picklescan --with numpy
+  # Versions up to 0.2.1 installed picklescan with uv tool into this folder.
+  if [ -d /opt/security-scan/tools ]; then
+    run rm -rf /opt/security-scan/tools
+  fi
+  pyver=$(/usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+  if [ ! -x "$PICKLE_VENV/bin/python" ] || [ ! -d "$PICKLE_VENV/lib/python${pyver}" ]; then
+    run env UV_PYTHON_PREFERENCE=only-system \
+      uv venv --clear --no-config --python /usr/bin/python3 "$PICKLE_VENV"
+  fi
+  run env UV_PYTHON_PREFERENCE=only-system \
+    uv pip sync --no-config --python "$PICKLE_VENV/bin/python" \
+    --require-hashes --only-binary :all: "$PICKLE_REQS"
+  # Replace the link only if it is absent or one this installer made.
+  if [ ! -e /usr/local/bin/picklescan ] && [ ! -L /usr/local/bin/picklescan ] ||
+    { [ -L /usr/local/bin/picklescan ] &&
+      [[ "$(readlink /usr/local/bin/picklescan)" == /opt/security-scan/* ]]; }; then
+    run ln -sfn "$PICKLE_VENV/bin/picklescan" /usr/local/bin/picklescan
+  else
+    echo "  /usr/local/bin/picklescan exists and was not made by this installer; left alone"
+    NOTES+=("/usr/local/bin/picklescan was not made by this installer. Remove it and re-run, so the models scan uses the pinned copy in ${PICKLE_VENV}.")
+  fi
 else
   echo "  uv is not installed, so picklescan was skipped. Install it with: sudo pacman -S uv"
   NOTES+=("uv is not installed: run sudo pacman -S uv, then re-run this installer so the models scan works.")

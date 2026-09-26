@@ -60,9 +60,19 @@ scanned. From a root shell, or to choose another account, pass
 It installs, in order:
 
 1. The packages above, with `pacman -S --needed`.
-2. `picklescan`, with `uv`, into `/opt/security-scan/tools`, with its command
-   linked as `/usr/local/bin/picklescan`. It goes in a root-owned folder rather
-   than your `~/.local` because it runs as root.
+2. `picklescan` and `numpy`, with `uv`, into a virtual environment in
+   `/opt/security-scan/picklescan`, with the command linked as
+   `/usr/local/bin/picklescan`. It goes in a root-owned folder rather than your
+   `~/.local` because it runs as root. Both come from PyPI, so they are pinned
+   to the exact versions and SHA-256 hashes in
+   `system/picklescan-requirements.txt`. The installer runs
+   `uv pip sync --require-hashes --only-binary :all:` with that file: any
+   download whose hash is not listed is refused, and nothing is built from
+   source. It never upgrades them on its own; a new version arrives only as a
+   change to that file in a new commit of this repository, which you can read
+   before re-running the installer. `uv pip sync` makes the environment match the
+   file exactly, and it is rebuilt when Arch moves to a new Python version. numpy is there
+   because picklescan needs it to read `.npy` files.
 3. `security-scan` and `security-report`, copied into `/usr/local/bin`.
 4. The configuration in `/etc/security-scan`, described under
    [Configuration](#configuration).

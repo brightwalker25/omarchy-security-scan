@@ -63,4 +63,4 @@ Dirs   = p+u+g+acl+xattrs+ftype
 !/usr/lib/.*/__pycache__/
 !/opt/containerd
 !/root/\.cache
-!/opt/security-scan/tools/.*/__pycache__/
+!/opt/security-scan/picklescan/.*/__pycache__/
