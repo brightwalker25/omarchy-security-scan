@@ -6,16 +6,33 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-09-27
+
 ### Fixed
 
 - AIDE no longer reports a symlink as red when a package's own install
-  script made it, such as one that points `/usr/bin/<name>` at the build for
-  this CPU on every upgrade. It is explained only while it resolves to a file
-  the package owns, pacman finds that file unaltered, and the package's
-  install script names the link's exact path; a link made any other way stays
-  red. The report applies the same check to a red line logged before the
-  scanner knew about it, against the system as it is now. Run the installer
-  again after upgrading, so the scheduled scan uses the new rule.
+  script made it and it points where that script points it. It is explained
+  only while it resolves to a file the package owns, pacman finds that file
+  unaltered, and the package's install script has an `ln -s` command for the
+  link's exact path whose target is written out in full and resolves to that
+  same file. The report applies the same check to a red line logged before
+  the scanner knew about it, against the system as it is now. Run the
+  installer again after upgrading, so the scheduled scan uses the new rule.
+
+### Security
+
+- The first version of that check, on the main branch but never released,
+  accepted a link to any verified file of the package whose install script
+  named the link's path. A system command link repointed to a different file
+  from the same package was therefore reported as a package change instead
+  of red, in both the scan and the weekly report. The link's current target
+  must now be exactly the target the install script gives. A target held in
+  a variable, two different targets for the same link, an `ln` without `-s`,
+  or an `ln` option the parser does not understand leaves the link red.
+  Reported in omacom/omarchy-plugin-marketplace#8732.
+- The scan and the report now read install scripts with one parser, in
+  `security-report`, which `security-scan` runs through a hidden
+  `--scriptlet-link-target` option, so the two cannot disagree.
 
 ## [0.2.2] - 2026-09-26
 

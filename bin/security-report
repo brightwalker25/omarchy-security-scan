@@ -26,6 +26,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -252,11 +253,100 @@ def _names_exactly(text, path):
     return re.search(re.escape(path) + r"(?![A-Za-z0-9_.-])", text) is not None
 
 
+# Options of ln(1) that take no argument and leave the meaning of
+# `ln -s TARGET LINK` unchanged. Anything else, such as -t, makes the command
+# too hard to read with certainty.
+_LN_SHORT = set("sfnrvLPT")
+_LN_LONG = {"--symbolic", "--force", "--no-dereference", "--relative", "--verbose",
+            "--logical", "--physical", "--no-target-directory"}
+_LN_LEAD = {"then", "do", "else", "{", "!", "command"}
+
+
+def _ln_commands(line):
+    """The ln commands on one line of shell, each as its list of arguments,
+    or None when the line cannot be split into words."""
+    lex = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = "#"
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return None
+    commands, words = [], []
+    skip = False
+    for tok in tokens + [";"]:
+        if skip:
+            skip = False
+            continue
+        if tok and all(c in "();<>|&" for c in tok):
+            if tok[0] in "<>":
+                # A redirection: drop its file, and a file descriptor number.
+                skip = True
+                if words and words[-1].isdigit():
+                    words.pop()
+                continue
+            while words and words[0] in _LN_LEAD:
+                words.pop(0)
+            if words and (words[0] == "ln" or words[0].endswith("/ln")):
+                commands.append(words[1:])
+            words = []
+        else:
+            words.append(tok)
+    return commands
+
+
+def scriptlet_link_target(script, link):
+    """The file that `script` (a package's install script) makes `link` point
+    at, fully resolved, or None when that cannot be told with certainty.
+
+    Every `ln` command whose last argument is exactly `link` must be a plain
+    `ln -s TARGET LINK` with a literal TARGET: no variable, command
+    substitution or glob. All of them must resolve to the same file. A target
+    held in a variable, two different targets, an ln without -s, or an option
+    this does not understand all give None, so the link stays red."""
+    text = re.sub(r"\\\n", " ", script)
+    found = set()
+    for line in text.splitlines():
+        if not _names_exactly(line, link):
+            continue
+        commands = _ln_commands(line)
+        if commands is None:
+            return None
+        for args in commands:
+            if link not in args:
+                continue
+            symbolic, operands, opts_done = False, [], False
+            for a in args:
+                if opts_done or a == "-" or not a.startswith("-"):
+                    operands.append(a)
+                elif a == "--":
+                    opts_done = True
+                elif a.startswith("--"):
+                    if a not in _LN_LONG:
+                        return None
+                    symbolic |= a == "--symbolic"
+                elif set(a[1:]) <= _LN_SHORT:
+                    symbolic |= "s" in a
+                else:
+                    return None
+            if operands[-1] != link:
+                continue    # The link is the source here, not the link made.
+            if len(operands) != 2 or not symbolic:
+                return None
+            target = operands[0]
+            if not target or any(c in target for c in "$`*?[]{}~\\"):
+                return None
+            found.add(os.path.realpath(os.path.join(os.path.dirname(link), target)))
+    return found.pop() if len(found) == 1 else None
+
+
 def scriptlet_link_explains(line):
     """True when a RED unpackaged-file line is a symlink a package's own
     install script makes: it still resolves to a file the package owns, pacman
-    finds that file unaltered, and the install script names the link's exact
-    path. Kept in step with scriptlet_link() in security-scan."""
+    finds that file unaltered, and the install script's own `ln -s` command
+    for the link's exact path points it at that same file. security-scan
+    calls scriptlet_link_target() through --scriptlet-link-target, so both
+    use this one parser."""
     m = re.match(r"(?:added|changed) (\S+) \(unpackaged file in a system code path\)$", line)
     if not m:
         return False
@@ -285,7 +375,8 @@ def scriptlet_link_explains(line):
         script = Path(f"/var/lib/pacman/local/{owner}-{version[1]}/install").read_text()
     except OSError:
         return False
-    return _names_exactly(script, path)
+    want = scriptlet_link_target(script, path)
+    return want is not None and want == target
 
 
 def integrity(now, since):
@@ -831,7 +922,22 @@ def main():
     ap.add_argument("--html", metavar="FILE")
     ap.add_argument("--status", action="store_true", help="print only the overall rating")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    # For security-scan, so the scan and this report read install scripts
+    # with one parser. Prints the resolved target, or exits 1.
+    ap.add_argument("--scriptlet-link-target", nargs=2, metavar=("SCRIPT", "LINK"),
+                    help=argparse.SUPPRESS)
     a = ap.parse_args()
+
+    if a.scriptlet_link_target:
+        script, link = a.scriptlet_link_target
+        try:
+            want = scriptlet_link_target(Path(script).read_text(), link)
+        except (OSError, UnicodeDecodeError):
+            want = None
+        if want is None:
+            return 1
+        print(want)
+        return 0
 
     now = dt.datetime.now().replace(microsecond=0)
     since = now - dt.timedelta(days=a.days)

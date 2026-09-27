@@ -188,10 +188,13 @@ explains each change before it is reported:
   graphics card, from their install script, on every upgrade. No package owns
   such a link, so it would read as an unpackaged file in `/usr/bin`. It is a
   package change only while it resolves to a file a package owns, pacman finds
-  that file unaltered, and that same package's install script names the
-  link's exact path. A link made any other way, even to a genuine program,
-  stays red. The weekly report applies the same check to a red line logged
-  before this rule existed.
+  that file unaltered, and that same package's install script has an `ln -s`
+  command for the link's exact path whose target is written out in full and
+  resolves to that same file. A link repointed to any other file, even
+  another file of the same package, stays red. So does a link whose target
+  the install script only works out when it runs (held in a variable), or
+  for which it names two different targets. The weekly report applies the
+  same check to a red line logged before this rule existed.
 
 After each check it re-baselines, so the next run reports only what is new. The
 previous baseline is kept as `/var/lib/aide/aide.db.prev.gz`, and the logs keep

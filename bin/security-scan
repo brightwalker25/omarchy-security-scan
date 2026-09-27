@@ -311,16 +311,19 @@ aide)
     return 1
   }
 
-  # Symlinks a package's own install script makes, such as a program that
-  # points /usr/bin/<name> at the build for this CPU on every upgrade. No
-  # package owns the link itself, so pacman cannot vouch for it. It is
-  # explained only while it resolves to a file a package owns and pacman
-  # verifies, and that package's install script names the link's exact path.
-  # A link anyone else made fails the last test and stays red. Prints the
-  # package. security-report holds the same check, for RED lines logged
-  # before this one existed; change both together.
+  # Symlinks a package's own install script makes. No package owns the link
+  # itself, so pacman cannot vouch for it. It is explained only while it
+  # resolves to a file a package owns and pacman verifies, and that package's
+  # install script has an `ln -s` command for the link's exact path whose
+  # literal target resolves to that same file. A target the script only knows
+  # at run time (a variable), two different targets, or a link repointed to
+  # any other file stays red. Prints the package. The install script is read
+  # by security-report's parser, so the scan and the report agree; the rest
+  # of this check is repeated there for RED lines logged before it existed,
+  # so change both together.
+  report_bin="$(dirname -- "$(readlink -f -- "$0")")/security-report"
   scriptlet_link() {
-    local path="$1" target owner ver script
+    local path="$1" target owner ver script want
     [ -L "$path" ] || return 1
     target=$(readlink -f -- "$path") && [ -f "$target" ] || return 1
     owner=$(pacman -Qqo -- "$target" 2>/dev/null | head -1)
@@ -329,16 +332,10 @@ aide)
     printf '%s\n' "${pkg_bad[$owner]}" | grep -qF " ${target} " && return 1
     ver=$(pacman -Q -- "$owner" 2>/dev/null | awk '{ print $2 }')
     script="/var/lib/pacman/local/${owner}-${ver}/install"
-    [ -n "$ver" ] && [ -f "$script" ] || return 1
-    # The exact path, not a longer one that starts with it.
-    awk -v p="$path" '{
-        s = $0
-        while ((i = index(s, p)) > 0) {
-          c = substr(s, i + length(p), 1)
-          if (c !~ /[A-Za-z0-9_.-]/) { found = 1; exit }
-          s = substr(s, i + 1)
-        }
-      } END { exit !found }' "$script" || return 1
+    [ -n "$ver" ] && [ -f "$script" ] && [ -f "$report_bin" ] || return 1
+    want=$(python3 -I "$report_bin" --scriptlet-link-target "$script" "$path" 2>/dev/null) ||
+      return 1
+    [ -n "$want" ] && [ "$want" = "$target" ] || return 1
     echo "$owner"
   }
 
@@ -400,7 +397,7 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
     elif hook=$(rebuild_hook "$path") && [ -n "$hook" ] && hook_wrote "$hook" "$path"; then
       verdict="PKG ${what} ${path} (rebuilt by pacman's ${hook%.hook} hook)"
     elif link_pkg=$(scriptlet_link "$path") && [ -n "$link_pkg" ]; then
-      verdict="PKG ${what} ${path} (link made by ${link_pkg}'s install script, to a file pacman verifies)"
+      verdict="PKG ${what} ${path} (link made by ${link_pkg}'s install script, to the file it names, which pacman verifies)"
     else
       case "$path" in
         /boot/*)
