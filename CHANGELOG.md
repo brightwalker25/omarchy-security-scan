@@ -4,6 +4,19 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 [semantic versioning](https://semver.org), and the format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- AIDE no longer reports a symlink as red when a package's own install
+  script made it, such as one that points `/usr/bin/<name>` at the build for
+  this CPU on every upgrade. It is explained only while it resolves to a file
+  the package owns, pacman finds that file unaltered, and the package's
+  install script names the link's exact path; a link made any other way stays
+  red. The report applies the same check to a red line logged before the
+  scanner knew about it, against the system as it is now. Run the installer
+  again after upgrading, so the scheduled scan uses the new rule.
+
 ## [0.2.2] - 2026-09-26
 
 ### Security

@@ -238,6 +238,56 @@ def hook_explains(line):
     return all(os.path.exists(f) for f in files) and ok(m.group(1))
 
 
+def _pacman(*args):
+    try:
+        r = subprocess.run(["pacman", *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def _names_exactly(text, path):
+    """True when `path` appears in `text` on its own, not as the start of a
+    longer path."""
+    return re.search(re.escape(path) + r"(?![A-Za-z0-9_.-])", text) is not None
+
+
+def scriptlet_link_explains(line):
+    """True when a RED unpackaged-file line is a symlink a package's own
+    install script makes: it still resolves to a file the package owns, pacman
+    finds that file unaltered, and the install script names the link's exact
+    path. Kept in step with scriptlet_link() in security-scan."""
+    m = re.match(r"(?:added|changed) (\S+) \(unpackaged file in a system code path\)$", line)
+    if not m:
+        return False
+    path = m.group(1)
+    if not os.path.islink(path):
+        return False
+    target = os.path.realpath(path)
+    if not os.path.isfile(target):
+        return False
+    owner = (_pacman("-Qqo", "--", target) or "").split("\n")[0].strip()
+    version = (_pacman("-Q", "--", owner) or "").split() if owner else []
+    if len(version) != 2:
+        return False
+    try:
+        checked = subprocess.run(["pacman", "-Qkk", owner], capture_output=True, text=True,
+                                 timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # The same mismatches the scanner counts; a bare mtime mismatch is harmless.
+    bad = re.compile(r"checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch"
+                     r"|UID mismatch|GID mismatch")
+    for out_line in (checked.stdout + checked.stderr).splitlines():
+        if f" {target} " in out_line and bad.search(out_line):
+            return False
+    try:
+        script = Path(f"/var/lib/pacman/local/{owner}-{version[1]}/install").read_text()
+    except OSError:
+        return False
+    return _names_exactly(script, path)
+
+
 def integrity(now, since):
     s = Section("System file integrity (AIDE)", GREEN, "")
     recent, _ = logs("aide", since)
@@ -247,7 +297,8 @@ def integrity(now, since):
     reds, ambers, pkg = [], [], 0
     for when, p in recent:
         for line in read(p).splitlines():
-            if line.startswith("RED ") and hook_explains(line[4:]):
+            if line.startswith("RED ") and (hook_explains(line[4:])
+                                            or scriptlet_link_explains(line[4:])):
                 pkg += 1
             elif line.startswith("RED "):
                 reds.append((when, line[4:]))

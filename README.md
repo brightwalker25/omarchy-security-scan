@@ -184,6 +184,14 @@ explains each change before it is reported:
   browser's own policies and those two switches. Any other policy
   leaves it red. The weekly report applies the same check to a red line
   logged before this rule existed.
+- Some packages link `/usr/bin/<name>` to the build that suits this CPU or
+  graphics card, from their install script, on every upgrade. No package owns
+  such a link, so it would read as an unpackaged file in `/usr/bin`. It is a
+  package change only while it resolves to a file a package owns, pacman finds
+  that file unaltered, and that same package's install script names the
+  link's exact path. A link made any other way, even to a genuine program,
+  stays red. The weekly report applies the same check to a red line logged
+  before this rule existed.
 
 After each check it re-baselines, so the next run reports only what is new. The
 previous baseline is kept as `/var/lib/aide/aide.db.prev.gz`, and the logs keep
