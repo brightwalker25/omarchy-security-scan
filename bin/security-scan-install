@@ -8,6 +8,11 @@
 #
 # The desktop user is the account that ran sudo. Pass --user NAME to choose
 # another one, or when running from a root shell.
+#
+# A file already at one of the paths this installer writes is replaced or
+# removed only when it is this plugin's own. Every path is checked before
+# anything changes, and if one holds something else the installer lists it
+# and stops, leaving the machine as it was. See "Ownership" below.
 
 set -euo pipefail
 
@@ -37,11 +42,30 @@ done
 
 SRC=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 DATE=$(date +%Y%m%d)
-PICKLE_VENV=/opt/security-scan/picklescan
+ROOT_UID=0
+UNIT_DIR=/etc/systemd/system
+USER_UNIT_DIR=/etc/systemd/user
+BIN_DIR=/usr/local/bin
+OPT=/opt/security-scan
+PICKLE_VENV="$OPT/picklescan"
+# Versions up to 0.2.1 installed picklescan with uv tool into this folder.
+LEGACY_TOOL_DIR="$OPT/tools"
 PICKLE_REQS="$SRC/system/picklescan-requirements.txt"
 ETC=/etc/security-scan
+RKH_LOCAL=/etc/rkhunter.conf.local
+AIDE_DB=/var/lib/aide/aide.db.gz
+RKH_DB=/var/lib/rkhunter/db/rkhunter.dat
+RUN_USER=/run/user
 TIMERS=(arch-audit aide gitleaks lynis models rkhunter)
+PROGRAMS=(security-scan security-report)
 NOTES=()
+
+# The exact units this plugin installs. Install, upgrade and uninstall touch
+# these names and no others, so a unit an administrator added under a similar
+# name, such as security-scan-foo.timer, is never replaced or removed.
+SYSTEM_UNITS=(security-scan@.service)
+for t in "${TIMERS[@]}"; do SYSTEM_UNITS+=("security-scan-${t}.timer"); done
+USER_UNITS=(security-report.service security-report.timer)
 
 # A dry run only reads, so it is allowed without root. That makes it possible
 # to check what the installer would do before handing it root.
@@ -63,19 +87,215 @@ run() {
 
 say() { printf '==> %s\n' "$*"; }
 
-# Write stdin to a root-owned file. Rendering to a temporary file first means
-# a failed render never leaves a half-written config in /etc.
+# Write stdin to a root-owned file. The content goes to a temporary file in the
+# same folder, which is then renamed over the destination. A failed or
+# interrupted run therefore never leaves a half-written file behind, and the
+# rename replaces whatever directory entry is at the destination rather than
+# writing through it, so a symlink there is never followed. The temporary
+# name starts with a dot and ends in random letters, so systemd never loads
+# it as a unit. A file that already has this content and mode is left as it
+# is, so that re-running the installer does not show up in AIDE as a change.
 put() {
-  local dest="$1" mode="$2" tmp
-  printf '  write %s (mode %s)\n' "$dest" "$mode"
+  local dest="$1" mode="$2" dir tmp
+  dir=$(dirname "$dest")
   if [ "$DRY" -eq 1 ]; then
+    printf '  write %s (mode %s)\n' "$dest" "$mode"
     cat >/dev/null
     return 0
   fi
-  tmp=$(mktemp)
-  cat >"$tmp"
-  install -D -o root -g root -m "$mode" "$tmp" "$dest"
-  rm -f "$tmp"
+  if [ ! -d "$dir" ]; then
+    install -d -m 0755 "$dir"
+    chown root:root "$dir"
+  fi
+  tmp=$(mktemp "${dir}/.${dest##*/}.XXXXXX")
+  PUT_TMP=$tmp
+  if ! cat >"$tmp"; then
+    rm -f "$tmp"
+    echo "could not write ${dest}" >&2
+    exit 1
+  fi
+  if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$tmp" "$dest" &&
+    [ "$(stat -c '%a:%u' -- "$dest")" = "${mode#0}:${ROOT_UID}" ]; then
+    rm -f "$tmp"
+    PUT_TMP=""
+    printf '  keep %s (up to date)\n' "$dest"
+    return 0
+  fi
+  printf '  write %s (mode %s)\n' "$dest" "$mode"
+  if ! chown root:root "$tmp" || ! chmod "$mode" "$tmp" || ! mv -fT "$tmp" "$dest"; then
+    rm -f "$tmp"
+    echo "could not write ${dest}" >&2
+    exit 1
+  fi
+  PUT_TMP=""
+}
+# A run that is interrupted between writing a temporary file and renaming it
+# into place removes the temporary file on the way out.
+PUT_TMP=""
+trap 'if [ -n "$PUT_TMP" ]; then rm -f -- "$PUT_TMP"; fi' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# ---------------------------------------------------------------------------
+# Ownership
+# ---------------------------------------------------------------------------
+#
+# Every path below is one this plugin chose, but an administrator may have put
+# something of their own there, so nothing at one of them is replaced or
+# removed unless it is recognisably this plugin's.
+#
+# A unit counts as ours only when it is a regular file, not a symlink, owned
+# by root, whose content is byte for byte a unit this plugin has shipped: the
+# copy in this checkout, or one of the earlier versions listed in
+# SHIPPED_UNIT_SHA256. A unit that has been edited since it was installed is
+# treated as the administrator's, because overwriting it would silently undo
+# their change. Local changes belong in a drop-in (systemctl edit), which this
+# installer never touches.
+#
+# The programs in /usr/local/bin are this plugin's code, which the installer
+# exists to update, so one counts as ours when it is a root-owned regular file
+# whose second line is the line that every version of that program has
+# carried (PROGRAM_SIGNATURE). A symlink there counts as ours only when it
+# points at a copy of the same program, such as a link into a checkout of this
+# repository. A program of the same name from anywhere else is refused.
+
+# Every version of each unit ever committed to this repository, by SHA-256,
+# so that running this installer over an earlier release upgrades it in place.
+# The copy in this checkout is recognised by hashing it, so it needs no entry.
+# When a unit changes, the hash of the version it replaces is added here;
+# tests/sandbox-install.sh fails until every version in the git history is
+# listed.
+declare -A SHIPPED_UNIT_SHA256=(
+  # 0.2.1 to 0.2.8; no unit has changed since 0.2.1
+  [security-scan@.service]=de45e9ebff29f23da54b1d1726dd0b84ed91f2732d145b0483a67e2cf1769452
+  [security-scan-aide.timer]=f3f4f428cc6295d1f97b62f086a8ef16fb00a13af885cd60b52f0efecc6bd8c3
+  [security-scan-arch-audit.timer]=7876ce1ffba23c6116d7f1c0854a74e917a4e4b2342b16fa942655d54503f018
+  [security-scan-gitleaks.timer]=a7ab873d4459ceff43587e7295ecab303d482dce9bcde2610d8c163a90d99161
+  [security-scan-lynis.timer]=04970be469e72469c10faea974930993a6846d50371da096a3fab73d224cf4a4
+  [security-scan-models.timer]=5af71c55f0a27c52a68e97b2519c3e2200b12c5b0d008121fc356a2bd4d07bd9
+  [security-scan-rkhunter.timer]=e425bf4de7eb9c60bc6ea416208f0083f6dc82679a322fb623176174f644d2eb
+  [security-report.service]=a62b357244f7f57eeebe46dac86213fe26ccd9a4e570acaa1d1dad35c825f227
+  [security-report.timer]=7b72a4ab2f5cb2d43d802ee0106e2c977225022f7c10d35b02fc5d04abf8c500
+)
+
+declare -A PROGRAM_SIGNATURE=(
+  [security-scan]='# Periodic security scans. Driven by security-scan@.service and the'
+  [security-report]='"""Weekly security report: grades the security-scan logs red, amber, green.'
+)
+
+root_owned() { [ "$(stat -c %u -- "$1" 2>/dev/null)" = "$ROOT_UID" ]; }
+sha256_of() { sha256sum -- "$1" 2>/dev/null | cut -d' ' -f1; }
+present() { [ -e "$1" ] || [ -L "$1" ]; }
+
+# The shipped copy of a unit, by name.
+unit_source() {
+  case "$1" in
+    security-report.*) printf '%s\n' "$SRC/system/user/$1" ;;
+    *) printf '%s\n' "$SRC/system/units/$1" ;;
+  esac
+}
+
+unit_ours() {
+  local path="$1" name sum h
+  name=${path##*/}
+  [ -f "$path" ] && [ ! -L "$path" ] && root_owned "$path" || return 1
+  sum=$(sha256_of "$path")
+  [ -n "$sum" ] || return 1
+  [ "$sum" = "$(sha256_of "$(unit_source "$name")")" ] && return 0
+  for h in ${SHIPPED_UNIT_SHA256[$name]:-}; do
+    [ "$sum" = "$h" ] && return 0
+  done
+  return 1
+}
+
+has_signature() {
+  [ "$(sed -n 2p -- "$1" 2>/dev/null)" = "${PROGRAM_SIGNATURE[$2]}" ]
+}
+
+program_ours() {
+  local path="$1" name target
+  name=${path##*/}
+  if [ -L "$path" ]; then
+    target=$(readlink -f -- "$path") || return 1
+    [ "${target##*/}" = "$name" ] && [ -f "$target" ] && has_signature "$target" "$name"
+    return
+  fi
+  [ -f "$path" ] && root_owned "$path" && has_signature "$path" "$name"
+}
+
+# The picklescan link is ours when it points into this plugin's folder in /opt.
+picklescan_link_ours() {
+  [ -L "$1" ] && [[ "$(readlink -- "$1")" == "$OPT"/* ]]
+}
+
+# A real, root-owned folder that only root can write to: not a symlink, which
+# would send every write somewhere else, and not writable by group or others,
+# who could swap a file in it between a check and a write.
+real_root_dir() {
+  [ -d "$1" ] && [ ! -L "$1" ] && root_owned "$1" &&
+    [ $((8#$(stat -c %a -- "$1") & 8#022)) -eq 0 ]
+}
+
+# The picklescan environment is ours when it is a real, root-owned folder that
+# is a Python virtual environment and either carries the marker this
+# installer writes when it makes the environment, or has picklescan installed
+# in it, as every earlier release left it. uv venv --clear empties it, so any
+# other environment at that path must not be handed to it.
+VENV_MARKER=".security-scan-installer"
+venv_ours() {
+  real_root_dir "$1" && [ -f "$1/pyvenv.cfg" ] && [ ! -L "$1/pyvenv.cfg" ] && {
+    { [ -f "$1/$VENV_MARKER" ] && [ ! -L "$1/$VENV_MARKER" ]; } ||
+      compgen -G "$1/lib/python*/site-packages/picklescan-*.dist-info" >/dev/null
+  }
+}
+
+# The uv tool folder that versions up to 0.2.1 made holds picklescan's own
+# environment with uv's receipt in it. Only that environment is ours; any
+# other tool in the folder is not, so the folder goes only once it is empty
+# apart from uv's own lock and ignore files.
+legacy_tools_ours() {
+  real_root_dir "$1" && real_root_dir "$1/picklescan" &&
+    [ -f "$1/picklescan/uv-receipt.toml" ] && [ ! -L "$1/picklescan/uv-receipt.toml" ]
+}
+remove_legacy_tools() {
+  local dir="$1" f
+  run rm -rf "$dir/picklescan"
+  [ "$DRY" -eq 1 ] && return 0
+  for f in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    present "$f" || continue
+    case "${f##*/}" in
+      .lock | .gitignore) ;;
+      *)
+        echo "  ${dir} holds other tools; left in place"
+        return 0
+        ;;
+    esac
+  done
+  rm -f "$dir/.lock" "$dir/.gitignore" 2>/dev/null || true
+  rmdir "$dir" 2>/dev/null || echo "  ${dir} could not be removed; left in place"
+}
+
+# Why a path was not accepted, for the lists printed on stderr.
+why_not_ours() {
+  local path="$1" kind="$2"
+  if [ -L "$path" ]; then
+    echo "a symlink"
+  elif [ "$kind" = dir ]; then
+    if [ ! -d "$path" ]; then echo "not a folder"
+    elif ! root_owned "$path"; then echo "not owned by root"
+    elif [ $((8#$(stat -c %a -- "$path") & 8#022)) -ne 0 ]; then echo "writable by group or others"
+    else echo "not a folder this installer made"; fi
+  elif [ ! -f "$path" ]; then
+    echo "not a regular file"
+  elif ! root_owned "$path"; then
+    echo "not owned by root"
+  elif [ "$kind" = unit ]; then
+    echo "does not match any version of this unit that the plugin has shipped"
+  elif [ "$kind" = program ]; then
+    echo "not this plugin's program"
+  else
+    echo "not written by this installer"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -96,8 +316,14 @@ if ! entry=$(getent passwd "$TARGET_USER"); then
   echo "no such user: ${TARGET_USER}" >&2
   exit 1
 fi
+TARGET_USER=$(printf '%s' "$entry" | cut -d: -f1)
 TARGET_UID=$(printf '%s' "$entry" | cut -d: -f3)
 TARGET_HOME=$(printf '%s' "$entry" | cut -d: -f6)
+# --user 0, or another name for UID 0, is still root.
+if [ "$TARGET_UID" = 0 ]; then
+  echo "the desktop user cannot be root; run with sudo from that account, or pass --user NAME" >&2
+  exit 1
+fi
 
 # Both values end up inside double quotes in a file root sources, so anything
 # that could break out of the quotes is refused rather than escaped.
@@ -108,10 +334,10 @@ case "${TARGET_USER}${TARGET_HOME}" in
     ;;
 esac
 
-BUS="/run/user/${TARGET_UID}/bus"
+BUS="${RUN_USER}/${TARGET_UID}/bus"
 as_user() {
   run runuser -u "$TARGET_USER" -- env \
-    "XDG_RUNTIME_DIR=/run/user/${TARGET_UID}" \
+    "XDG_RUNTIME_DIR=${RUN_USER}/${TARGET_UID}" \
     "DBUS_SESSION_BUS_ADDRESS=unix:path=${BUS}" "$@"
 }
 
@@ -121,14 +347,20 @@ say "desktop user: ${TARGET_USER} (${TARGET_HOME})"
 # Uninstall
 # ---------------------------------------------------------------------------
 
+# Units and programs are removed only when they pass the same checks as an
+# upgrade, and only under the exact names in SYSTEM_UNITS, USER_UNITS and
+# PROGRAMS. Anything else is left where it is and listed at the end.
 if [ "$UNINSTALL" -eq 1 ]; then
+  kept=()
+  keep() { kept+=("$1 ($(why_not_ours "$1" "$2"))"); }
+
   say "stopping and disabling timers"
   for t in "${TIMERS[@]}"; do
-    if [ -e "/etc/systemd/system/security-scan-${t}.timer" ]; then
+    if unit_ours "${UNIT_DIR}/security-scan-${t}.timer"; then
       run systemctl disable --now "security-scan-${t}.timer"
     fi
   done
-  if [ -e /etc/systemd/user/security-report.timer ]; then
+  if unit_ours "${USER_UNIT_DIR}/security-report.timer"; then
     run systemctl --global disable security-report.timer
     if [ -S "$BUS" ]; then
       as_user systemctl --user stop security-report.timer
@@ -136,11 +368,12 @@ if [ "$UNINSTALL" -eq 1 ]; then
   fi
 
   say "removing units"
-  for f in /etc/systemd/system/security-scan@.service \
-    /etc/systemd/system/security-scan-*.timer \
-    /etc/systemd/user/security-report.service \
-    /etc/systemd/user/security-report.timer; do
-    if [ -e "$f" ]; then run rm -f "$f"; fi
+  for u in "${SYSTEM_UNITS[@]/#/${UNIT_DIR}/}" "${USER_UNITS[@]/#/${USER_UNIT_DIR}/}"; do
+    if unit_ours "$u"; then
+      run rm -f "$u"
+    elif present "$u"; then
+      keep "$u" unit
+    fi
   done
   run systemctl daemon-reload
   if [ -S "$BUS" ]; then
@@ -148,20 +381,56 @@ if [ "$UNINSTALL" -eq 1 ]; then
   fi
 
   say "removing programs"
-  for f in /usr/local/bin/security-scan /usr/local/bin/security-report; do
-    if [ -e "$f" ] || [ -L "$f" ]; then run rm -f "$f"; fi
+  for p in "${PROGRAMS[@]/#/${BIN_DIR}/}"; do
+    if program_ours "$p"; then
+      run rm -f "$p"
+    elif present "$p"; then
+      keep "$p" program
+    fi
   done
-  # Only remove the picklescan shim if it is the one this installer made.
-  if [ -L /usr/local/bin/picklescan ] &&
-    [[ "$(readlink /usr/local/bin/picklescan)" == /opt/security-scan/* ]]; then
-    run rm -f /usr/local/bin/picklescan
+  # Only remove the picklescan link if it is the one this installer made.
+  if picklescan_link_ours "${BIN_DIR}/picklescan"; then
+    run rm -f "${BIN_DIR}/picklescan"
   fi
-  if [ -d /opt/security-scan ]; then run rm -rf /opt/security-scan; fi
+  # Only the two folders this installer makes in /opt/security-scan are
+  # removed, and the folder itself only once it is empty.
+  if venv_ours "$PICKLE_VENV"; then
+    run rm -rf "$PICKLE_VENV"
+  elif present "$PICKLE_VENV"; then
+    keep "$PICKLE_VENV" dir
+  fi
+  if legacy_tools_ours "$LEGACY_TOOL_DIR"; then
+    remove_legacy_tools "$LEGACY_TOOL_DIR"
+  elif present "$LEGACY_TOOL_DIR"; then
+    keep "$LEGACY_TOOL_DIR" dir
+  fi
+  if real_root_dir "$OPT"; then
+    if [ "$DRY" -eq 1 ]; then
+      echo "  rmdir ${OPT} (if it is now empty)"
+    elif rmdir "$OPT" 2>/dev/null; then
+      echo "  rmdir ${OPT}"
+    else
+      kept+=("${OPT} (holds files this installer did not make)")
+    fi
+  elif present "$OPT"; then
+    keep "$OPT" dir
+  fi
+
+  # Units with similar names are not this plugin's, but a timer of that kind
+  # may have relied on security-scan@.service, so they are worth a mention.
+  others=()
+  for f in "$UNIT_DIR"/security-scan* "$USER_UNIT_DIR"/security-report*; do
+    present "$f" || continue
+    case " ${SYSTEM_UNITS[*]} ${USER_UNITS[*]} " in
+      *" ${f##*/} "*) continue ;;
+    esac
+    others+=("$f")
+  done
 
   echo
   echo "Left in place, because they hold your settings, history and baselines:"
   echo "  ${ETC}                 configuration and risk register"
-  echo "  /etc/rkhunter.conf.local           rkhunter overrides"
+  echo "  ${RKH_LOCAL}           rkhunter overrides"
   echo "  /var/log/security-scan             scan logs"
   echo "  /var/lib/aide                      AIDE baseline"
   echo "  /var/lib/security-scan             trusted copy of limine.conf"
@@ -169,8 +438,59 @@ if [ "$UNINSTALL" -eq 1 ]; then
   echo "Delete them by hand if you no longer want them, for example:"
   echo "  sudo rm -r ${ETC} /var/log/security-scan /var/lib/aide /var/lib/security-scan"
   echo "The packages (arch-audit, lynis, gitleaks, rkhunter, aide) were not removed."
+  if [ "${#kept[@]}" -gt 0 ]; then
+    echo >&2
+    echo "Left in place, because this installer did not put them there or they have been changed since it did:" >&2
+    printf '  %s\n' "${kept[@]}" >&2
+  fi
+  if [ "${#others[@]}" -gt 0 ]; then
+    echo >&2
+    echo "Not installed by this plugin, so left alone. Check whether they still work without it:" >&2
+    printf '  %s\n' "${others[@]}" >&2
+  fi
   exit 0
 fi
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+# Every path this installer writes over, or empties, is checked before
+# anything is changed, packages included. If one of them holds something that
+# is not this plugin's, the installer lists them all and stops, so a refusal
+# leaves the machine exactly as it was.
+say "checking what is already installed"
+conflicts=()
+conflict() { conflicts+=("$1 ($(why_not_ours "$1" "$2"))"); }
+for u in "${SYSTEM_UNITS[@]/#/${UNIT_DIR}/}" "${USER_UNITS[@]/#/${USER_UNIT_DIR}/}"; do
+  if present "$u" && ! unit_ours "$u"; then conflict "$u" unit; fi
+done
+for p in "${PROGRAMS[@]/#/${BIN_DIR}/}"; do
+  if present "$p" && ! program_ours "$p"; then conflict "$p" program; fi
+done
+for d in "$OPT" "$ETC"; do
+  if present "$d" && ! real_root_dir "$d"; then conflict "$d" dir; fi
+done
+if present "$PICKLE_VENV" && ! venv_ours "$PICKLE_VENV"; then
+  conflict "$PICKLE_VENV" dir
+fi
+# aide.conf is regenerated on every run, with a backup of a copy that differs.
+if present "$ETC/aide.conf" && { [ -L "$ETC/aide.conf" ] || [ ! -f "$ETC/aide.conf" ]; }; then
+  conflict "$ETC/aide.conf" file
+fi
+if [ "${#conflicts[@]}" -gt 0 ]; then
+  {
+    echo "These paths already exist and are not this plugin's, or have been changed since it installed them:"
+    printf '  %s\n' "${conflicts[@]}"
+    echo "Nothing has been changed. If they are left over from an earlier install of this"
+    echo "plugin and nothing else uses them, remove them and run this again. Otherwise they"
+    echo "belong to something else, and this plugin cannot be installed alongside it."
+    echo "To change one of this plugin's units, use a drop-in (systemctl edit UNIT),"
+    echo "which this installer leaves alone, rather than editing the unit file itself."
+  } >&2
+  exit 1
+fi
+echo "  nothing in the way"
 
 # ---------------------------------------------------------------------------
 # Packages
@@ -204,26 +524,33 @@ fi
 # rewrite every file under AIDE's watch.
 say "installing picklescan"
 if command -v uv >/dev/null 2>&1; then
+  if [ ! -d "$OPT" ]; then
+    run install -d -m 0755 "$OPT"
+    run chown root:root "$OPT"
+  fi
   # Versions up to 0.2.1 installed picklescan with uv tool into this folder.
-  if [ -d /opt/security-scan/tools ]; then
-    run rm -rf /opt/security-scan/tools
+  if legacy_tools_ours "$LEGACY_TOOL_DIR"; then
+    remove_legacy_tools "$LEGACY_TOOL_DIR"
+  elif present "$LEGACY_TOOL_DIR"; then
+    echo "  ${LEGACY_TOOL_DIR} was not made by this installer; left alone"
   fi
   pyver=$(/usr/bin/python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
   if [ ! -x "$PICKLE_VENV/bin/python" ] || [ ! -d "$PICKLE_VENV/lib/python${pyver}" ]; then
     run env UV_PYTHON_PREFERENCE=only-system \
       uv venv --clear --no-config --python /usr/bin/python3 "$PICKLE_VENV"
   fi
+  if ! present "$PICKLE_VENV/$VENV_MARKER"; then
+    put "$PICKLE_VENV/$VENV_MARKER" 0644 <<<'Made by security-scan-install. Removed on uninstall.'
+  fi
   run env UV_PYTHON_PREFERENCE=only-system \
     uv pip sync --no-config --python "$PICKLE_VENV/bin/python" \
     --require-hashes --only-binary :all: "$PICKLE_REQS"
   # Replace the link only if it is absent or one this installer made.
-  if [ ! -e /usr/local/bin/picklescan ] && [ ! -L /usr/local/bin/picklescan ] ||
-    { [ -L /usr/local/bin/picklescan ] &&
-      [[ "$(readlink /usr/local/bin/picklescan)" == /opt/security-scan/* ]]; }; then
-    run ln -sfn "$PICKLE_VENV/bin/picklescan" /usr/local/bin/picklescan
+  if ! present "${BIN_DIR}/picklescan" || picklescan_link_ours "${BIN_DIR}/picklescan"; then
+    run ln -sfn "$PICKLE_VENV/bin/picklescan" "${BIN_DIR}/picklescan"
   else
-    echo "  /usr/local/bin/picklescan exists and was not made by this installer; left alone"
-    NOTES+=("/usr/local/bin/picklescan was not made by this installer. Remove it and re-run, so the models scan uses the pinned copy in ${PICKLE_VENV}.")
+    echo "  ${BIN_DIR}/picklescan exists and was not made by this installer; left alone"
+    NOTES+=("${BIN_DIR}/picklescan was not made by this installer. Remove it and re-run, so the models scan uses the pinned copy in ${PICKLE_VENV}.")
   fi
 else
   echo "  uv is not installed, so picklescan was skipped. Install it with: sudo pacman -S uv"
@@ -237,12 +564,11 @@ fi
 # Copied, never symlinked. Both run as root, and a symlink into this checkout
 # would let anyone who can write the checkout (the desktop user) run code as
 # root. Updating the repo therefore changes nothing until this is re-run.
+# The preflight has already checked that whatever is at each path is ours; a
+# symlink there is replaced by the rename in put, never written through.
 say "installing programs"
-for prog in security-scan security-report; do
-  if [ -L "/usr/local/bin/${prog}" ]; then
-    run rm -f "/usr/local/bin/${prog}"
-  fi
-  run install -D -o root -g root -m 0755 "$SRC/bin/${prog}" "/usr/local/bin/${prog}"
+for prog in "${PROGRAMS[@]}"; do
+  put "${BIN_DIR}/${prog}" 0755 <"$SRC/bin/${prog}"
 done
 
 # ---------------------------------------------------------------------------
@@ -250,51 +576,74 @@ done
 # ---------------------------------------------------------------------------
 
 say "installing configuration in ${ETC}"
-run install -d -o root -g root -m 0755 "$ETC"
+if [ ! -d "$ETC" ]; then
+  run install -d -m 0755 "$ETC"
+  run chown root:root "$ETC"
+fi
 
 # AIDE reads its selection lines as regular expressions, so the home folder
 # must be escaped before it goes into the pattern.
 regex_escape() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|]/\\&/g'; }
 HOME_RE=$(regex_escape "$TARGET_HOME")
 
-if [ -e "$ETC/scan.conf" ]; then
+if present "$ETC/scan.conf"; then
   echo "  keep ${ETC}/scan.conf (exists)"
 else
   conf=$(<"$SRC/system/scan.conf.example")
   conf=${conf//@USER@/"$TARGET_USER"}
   conf=${conf//@HOME@/"$TARGET_HOME"}
-  printf '%s\n' "$conf" | put "$ETC/scan.conf" 0644
+  put "$ETC/scan.conf" 0644 <<<"$conf"
 fi
 
 # aide.conf is generated from the template, so it is replaced on every run.
-# A copy that differs is kept in case it was edited by hand.
+# A copy that differs is kept in case it was edited by hand, under a name
+# that is not yet taken, so no earlier backup is overwritten. The backup keeps
+# the mode of the file it copies, at most 0644, and the new file is never more
+# open than the one it replaces, so a file that was made private stays private.
 aide_conf=$(<"$SRC/system/aide.conf.in")
 aide_conf=${aide_conf//@HOME@/"$HOME_RE"}
-if [ -e "$ETC/aide.conf" ] && ! printf '%s\n' "$aide_conf" | cmp -s - "$ETC/aide.conf"; then
-  run cp -p "$ETC/aide.conf" "$ETC/aide.conf.bak-${DATE}"
+aide_mode=0644
+if [ -f "$ETC/aide.conf" ] && [ ! -L "$ETC/aide.conf" ]; then
+  old_mode=$(stat -c %a -- "$ETC/aide.conf")
+  aide_mode=$(printf '0%o' $((8#$old_mode & 8#644)))
+  if ! printf '%s\n' "$aide_conf" | cmp -s - "$ETC/aide.conf"; then
+    bak="$ETC/aide.conf.bak-${DATE}"
+    n=1
+    while present "$bak"; do
+      bak="$ETC/aide.conf.bak-${DATE}.${n}"
+      n=$((n + 1))
+    done
+    put "$bak" "$aide_mode" <"$ETC/aide.conf"
+  fi
 fi
-printf '%s\n' "$aide_conf" | put "$ETC/aide.conf" 0644
+# A here-string, not a pipe: put must run in this shell, where the trap that
+# removes an interrupted temporary file can see it.
+put "$ETC/aide.conf" "$aide_mode" <<<"$aide_conf"
 
-# These two hold the user's own rules and assessments. Never overwrite them.
+# These hold the user's own rules and assessments. Never overwrite them. A
+# symlink counts as existing even when it points nowhere, so nothing is ever
+# created through one.
 install_once() {
   local src="$1" dest="$2" mode="$3"
-  if [ -e "$dest" ]; then
+  if present "$dest"; then
     echo "  keep ${dest} (exists)"
   else
-    run install -D -o root -g root -m "$mode" "$src" "$dest"
+    put "$dest" "$mode" <"$src"
   fi
 }
 install_once "$SRC/system/gitleaks.example.toml" "$ETC/gitleaks.toml" 0644
 install_once "$SRC/system/risk-register.example.toml" "$ETC/risk-register.toml" 0644
-install_once "$SRC/system/rkhunter.conf.local.example" /etc/rkhunter.conf.local 0640
+install_once "$SRC/system/rkhunter.conf.local.example" "$RKH_LOCAL" 0640
 
 # ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
 
+# Only the units named in SYSTEM_UNITS and USER_UNITS, each of which the
+# preflight has checked is absent or ours.
 say "installing system units"
-for f in "$SRC"/system/units/*; do
-  run install -D -o root -g root -m 0644 "$f" "/etc/systemd/system/$(basename "$f")"
+for u in "${SYSTEM_UNITS[@]}"; do
+  put "${UNIT_DIR}/${u}" 0644 <"$(unit_source "$u")"
 done
 run systemctl daemon-reload
 for t in "${TIMERS[@]}"; do
@@ -305,8 +654,8 @@ done
 # Installed for all users in /etc/systemd/user so that no copy lives in a
 # home folder where it could drift from the repo.
 say "installing user units"
-for f in "$SRC"/system/user/*; do
-  run install -D -o root -g root -m 0644 "$f" "/etc/systemd/user/$(basename "$f")"
+for u in "${USER_UNITS[@]}"; do
+  put "${USER_UNIT_DIR}/${u}" 0644 <"$(unit_source "$u")"
 done
 run systemctl --global enable security-report.timer
 if [ -S "$BUS" ]; then
@@ -341,9 +690,9 @@ can_see() { [ -x "$(dirname "$1")" ]; }
 
 # security-scan aide creates the baseline itself on its first run.
 if [ "$HAVE_AIDE" -eq 1 ]; then
-  if ! can_see /var/lib/aide/aide.db.gz; then
+  if ! can_see "$AIDE_DB"; then
     echo "  cannot see the AIDE baseline without root; a real run starts the first scan if it is missing"
-  elif [ -s /var/lib/aide/aide.db.gz ]; then
+  elif [ -s "$AIDE_DB" ]; then
     echo "  keep AIDE baseline (exists)"
   else
     run systemctl start --no-block security-scan@aide.service
@@ -351,9 +700,9 @@ if [ "$HAVE_AIDE" -eq 1 ]; then
 fi
 # rkhunter needs a record of file properties before its first check, or every
 # file shows as changed.
-if ! can_see /var/lib/rkhunter/db/rkhunter.dat; then
+if ! can_see "$RKH_DB"; then
   echo "  cannot see the rkhunter baseline without root; a real run creates it if missing"
-elif [ -e /var/lib/rkhunter/db/rkhunter.dat ]; then
+elif [ -e "$RKH_DB" ]; then
   echo "  keep rkhunter baseline (exists)"
 else
   run rkhunter --propupd --nocolors
@@ -367,7 +716,7 @@ if [ -S "$BUS" ]; then
   if [ "$(id -u)" -eq "$TARGET_UID" ]; then
     systemctl --user list-timers security-report.timer --no-pager 2>/dev/null || true
   else
-    runuser -u "$TARGET_USER" -- env "XDG_RUNTIME_DIR=/run/user/${TARGET_UID}" \
+    runuser -u "$TARGET_USER" -- env "XDG_RUNTIME_DIR=${RUN_USER}/${TARGET_UID}" \
       "DBUS_SESSION_BUS_ADDRESS=unix:path=${BUS}" \
       systemctl --user list-timers security-report.timer --no-pager 2>/dev/null || true
   fi

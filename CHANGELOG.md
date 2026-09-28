@@ -6,6 +6,53 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-10-12
+
+### Added
+
+- `tests/sandbox-install.sh` runs the installer against a temporary folder
+  standing in for `/`, with the system commands replaced by stand-ins, and
+  checks fresh installs, upgrades from every release from 0.2.1 to 0.2.7,
+  uninstalls, and the refusals below. It needs no root.
+
+### Security
+
+- The installer replaced any existing file at the paths of its units in
+  `/etc/systemd/system` and `/etc/systemd/user`, and the uninstaller removed
+  every `security-scan-*.timer`, including timers this plugin never
+  installed. Both could overwrite or delete units an administrator manages.
+  A unit is now replaced or removed only when it is a regular file, not a
+  symlink, owned by root, whose content is exactly a unit this plugin has
+  shipped, either in the checkout or in an earlier release. The uninstaller
+  works from the exact list of names the plugin installs, not a glob, and
+  lists anything it leaves in place. Reported in
+  omacom/omarchy-plugin-marketplace#8732.
+- The same rule now covers the installer's other paths. Before it changes
+  anything, the installer checks `security-scan` and `security-report` in
+  `/usr/local/bin`, `/opt/security-scan`, the picklescan environment and
+  `/etc/security-scan`. If one holds something that is not this plugin's, it
+  lists every such path with the reason and stops, leaving the machine as it
+  was. The uninstaller removes only the picklescan environment from
+  `/opt/security-scan`, not the whole folder, and removes the folder itself
+  only once it is empty.
+- Files are written to a temporary name in the same folder and renamed into
+  place, so a symlink at the destination is replaced rather than written
+  through. Existing folders are no longer given new permissions, a
+  regenerated `aide.conf` is never more open than the file it replaces, its
+  backup keeps the original's permissions up to 0644, and an earlier backup
+  from the same day is no longer overwritten.
+- The picklescan environment in `/opt/security-scan` is replaced or removed
+  only when this installer made it: it carries a marker file the installer
+  now writes, or has picklescan installed in it. Any other virtual
+  environment at that path is refused. Of the uv tool folder from 0.2.1,
+  only picklescan is removed, and the folder only once nothing else is in
+  it.
+- `/opt/security-scan` and `/etc/security-scan` are refused when group or
+  others can write to them, and `aide.conf` is never read through a
+  symlink. `--user 0`, or another name for UID 0, is
+  refused like `root`. A temporary file is removed if the run is
+  interrupted before it is renamed into place.
+
 ## [0.2.7] - 2026-10-04
 
 ### Fixed

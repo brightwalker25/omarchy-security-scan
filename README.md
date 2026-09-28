@@ -28,6 +28,18 @@ itself. [INSTALL.md](INSTALL.md) covers the requirements, what the installer
 changes, the first-run baselines, the configuration files, running scans by
 hand, and uninstalling.
 
+## Removing
+
+```bash
+sudo ~/Work/omarchy-security-scan/bin/security-scan-install --uninstall
+omarchy plugin disable brightwalker25.security-scan
+rm ~/.config/omarchy/plugins/brightwalker25.security-scan
+```
+
+The uninstaller removes only the units and programs this plugin installed,
+and keeps your configuration, logs and baselines.
+[INSTALL.md](INSTALL.md#uninstalling) lists what stays and how to delete it.
+
 ## What it scans
 
 | Scan | Cadence | What it catches |
@@ -365,6 +377,17 @@ python3 -m unittest discover -s tests -v
 The tests cover the privacy section against the fixtures in
 `tests/fixtures/black-ops`. They run in a temporary folder and do not read
 your home folder, `/etc` or the scan logs.
+
+```bash
+bash tests/sandbox-install.sh
+```
+
+This runs the installer, and the installers of earlier releases, as your own
+user against a temporary folder that stands in for `/`, with `pacman`,
+`systemctl`, `uv` and the other system commands replaced by stand-ins. It
+checks fresh installs, upgrades from each release, uninstalls, and that files
+the plugin did not write are refused and left unchanged. It needs no root and
+changes nothing outside the temporary folder.
 
 ## Settings
 

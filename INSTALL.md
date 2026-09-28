@@ -89,6 +89,35 @@ everything else is brought up to date with the checkout. After pulling a new
 version of the repository, run it again: until you do, the installed programs
 and units stay as they were.
 
+### Files that are not this plugin's
+
+Before it changes anything, packages included, the installer checks every path
+it would write over. A unit in `/etc/systemd/system` or `/etc/systemd/user` is
+replaced only when it is a regular file, not a symlink, owned by root, whose
+content is exactly a unit this plugin has shipped, in this checkout or in an
+earlier release. `security-scan` and `security-report` in `/usr/local/bin` are
+replaced only when they are this plugin's programs. `/opt/security-scan` and
+`/etc/security-scan` must be real folders owned by root that only root can
+write to. `/opt/security-scan/picklescan` must be a Python virtual environment
+that this installer made: it carries the marker file
+`.security-scan-installer`, or has picklescan installed in it, as earlier
+releases left it. If any path holds something else, the installer lists each
+one with the reason and stops without changing the machine. The desktop user
+can never be root, under any name or as `--user 0`.
+
+A unit you have edited counts as yours, so it is not overwritten. To change one
+of this plugin's units, use a drop-in instead (`sudo systemctl edit
+security-scan-lynis.timer`, for example), which the installer never touches.
+To go back to the shipped unit, delete the edited file and run the installer
+again.
+
+New files are written to a temporary name in the same folder and then renamed
+into place, so a symlink at the destination is replaced rather than followed,
+and an interrupted run never leaves a half-written file. A file that is
+already up to date is left as it is, so re-running the installer does not show
+up in AIDE. Existing folders keep their permissions, and a regenerated
+`aide.conf` is never made more open than the file it replaces.
+
 If you once installed the report's units by hand in `~/.config/systemd/user`,
 those copies take precedence over the ones in `/etc/systemd/user` and would
 hide every future update. The installer does not delete files in your home
@@ -208,7 +237,9 @@ reads and so is taken from the file alone.
 `aide.conf` is generated from `system/aide.conf.in` in the checkout, with your
 home folder filled in, and is replaced every time the installer runs. If the
 installed copy differs from what would be generated, it is saved first as
-`aide.conf.bak-YYYYMMDD`. To change what AIDE watches, edit the template and
+`aide.conf.bak-YYYYMMDD`, with the same permissions. A backup from earlier the
+same day is not overwritten; the new one gets a `.1`, `.2` and so on after the
+date. To change what AIDE watches, edit the template and
 run the installer again, not the installed file.
 
 `gitleaks.toml` extends the upstream rules. The example shows how to add a
@@ -456,10 +487,20 @@ as it said; until then they override the installed ones.
 sudo bin/security-scan-install --uninstall
 ```
 
-This stops and disables every timer, removes the system and user units,
-`security-scan`, `security-report`, the `picklescan` link and
-`/opt/security-scan`. It leaves in place, because they hold your settings,
-history and baselines:
+This stops and disables the plugin's timers, removes its system and user units,
+`security-scan`, `security-report`, the `picklescan` link if it points into
+`/opt/security-scan`, and the picklescan environment there. Of the uv tool
+folder that versions up to 0.2.1 made, `/opt/security-scan/tools`, it removes
+only picklescan, and the folder only if nothing else is in it. It removes only the exact names this
+plugin installs, and only files that pass the same checks as an install, so a
+unit of your own with a similar name, such as `security-scan-foo.timer`, is
+never disabled or removed. A unit you have edited, a program of the same name
+from somewhere else, and anything else you put in `/opt/security-scan` are
+left in place and listed at the end, along with any other `security-scan*` or
+`security-report*` units found, which may have depended on this plugin.
+
+It also leaves in place, because they hold your settings, history and
+baselines:
 
 | Left in place | Holds |
 |---|---|
@@ -467,6 +508,7 @@ history and baselines:
 | `/etc/rkhunter.conf.local` | rkhunter exceptions |
 | `/var/log/security-scan` | scan logs |
 | `/var/lib/aide` | AIDE baselines |
+| `/var/lib/security-scan` | trusted copy of limine.conf |
 | `~/.local/share/security-report` | weekly HTML reports |
 
 The packages (`arch-audit`, `lynis`, `gitleaks`, `rkhunter` and `aide`) are not
@@ -474,7 +516,7 @@ removed, and neither is rkhunter's own database in `/var/lib/rkhunter`. To
 delete the rest:
 
 ```bash
-sudo rm -r /etc/security-scan /var/log/security-scan /var/lib/aide
+sudo rm -r /etc/security-scan /var/log/security-scan /var/lib/aide /var/lib/security-scan
 rm -r ~/.local/share/security-report
 ```
 
