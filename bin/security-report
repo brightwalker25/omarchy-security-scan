@@ -430,25 +430,30 @@ def rootkit(now, since):
     if not recent:
         s.rating, s.headline = AMBER, "No rkhunter result this period."
         return s
-    warned = 0
-    for when, p in recent:
-        text = read(p)
-        m = re.search(r"summary: (\d+) warning", text)
-        n = int(m.group(1)) if m else 0
-        if n:
-            warned += n
-            # A "properties changed" warning whose files pacman verified was
-            # accepted by the scanner; only its UNVERIFIED files still count.
-            found = [w for w in re.findall(r"^Warning: (.*)$", text, re.M)
-                     if "file properties have changed" not in w]
-            found += [f"File changed and pacman cannot vouch for it: {f}"
-                      for f in re.findall(r"^UNVERIFIED (.*)$", text, re.M)]
-            for w in found:
-                s.add(RED, w, when.strftime("%a %d %b"),
-                      "Investigate before anything else. If it is a new false positive, "
-                      "verify with pacman -Qkk and add it to /etc/rkhunter.conf.local.")
-    s.headline = (f"{warned} warning(s)." if warned
-                  else f"{len(recent)} check(s) ran with no warnings.")
+    # Grade the latest run only. rkhunter checks the whole system each time,
+    # so a clean run supersedes the warnings of the runs before it; counting
+    # the week's runs would keep a cleared warning red for up to seven days.
+    when, p = recent[-1]
+    text = read(p)
+    m = re.search(r"summary: (\d+) warning", text)
+    warned = int(m.group(1)) if m else 0
+    if warned:
+        # A "properties changed" warning whose files pacman verified was
+        # accepted by the scanner; only its UNVERIFIED files still count.
+        found = [w for w in re.findall(r"^Warning: (.*)$", text, re.M)
+                 if "file properties have changed" not in w]
+        found += [f"File changed and pacman cannot vouch for it: {f}"
+                  for f in re.findall(r"^UNVERIFIED (.*)$", text, re.M)]
+        for w in found:
+            s.add(RED, w, when.strftime("%a %d %b"),
+                  "Investigate before anything else. If it is a new false positive, "
+                  "verify with pacman -Qkk and add it to /etc/rkhunter.conf.local.")
+    earlier = sum(1 for _, q in recent[:-1]
+                  if re.search(r"summary: [1-9]\d* warning", read(q)))
+    cleared = (f" {earlier} earlier run(s) this period had warnings that this run no longer shows."
+               if earlier and not warned else "")
+    s.headline = (f"{warned} warning(s) in the latest check." if warned
+                  else f"The latest check found no warnings.{cleared}")
     return s
 
 

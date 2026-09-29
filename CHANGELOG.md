@@ -6,6 +6,16 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-09-29
+
+### Fixed
+
+- The rootkit section grades only the latest rkhunter run. It used to add up
+  the warnings of every run in the report's window, so a warning that a later
+  clean run had cleared, such as the missing passwd and group copies on the
+  first run, stayed red for up to seven days. When an earlier run had warnings
+  the latest one no longer shows, the headline now says so.
+
 ## [0.2.3] - 2026-09-27
 
 ### Fixed
