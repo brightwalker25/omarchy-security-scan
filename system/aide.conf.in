@@ -63,4 +63,7 @@ Dirs   = p+u+g+acl+xattrs+ftype
 !/usr/lib/.*/__pycache__/
 !/opt/containerd
 !/root/\.cache
+# Rewritten with fresh random bytes at every boot and shutdown; its content
+# is meant to change and says nothing about integrity.
+!/boot/loader/random-seed$
 !/opt/security-scan/picklescan/.*/__pycache__/
