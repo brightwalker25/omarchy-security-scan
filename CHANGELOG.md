@@ -6,6 +6,26 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-09-30
+
+### Added
+
+- A `SCRIPTLET_LINKS` setting in `scan.conf` lists symlinks, each with the
+  package whose files it may point to, that the package's install script
+  points at a file it picks when it runs, such as voxtype-bin's
+  `/usr/bin/voxtype`. The general rule rightly leaves such a link red, since
+  the target cannot be read from the script. A listed link is a package change
+  only while it is a symlink, not a file, and resolves to a file owned by the
+  listed package alone, pacman finds that file unaltered, and the package's
+  install script has an `ln -s` command for the link's exact path. The list is
+  empty by default, so nothing changes unless you add to it, and links not on
+  it are treated exactly as before. The value is read from the file only,
+  must be written out in full, and is ignored if the file is not root's
+  alone. The scan runs the report's own check through a hidden option, and
+  the report applies it to red lines logged before the link was listed. Add
+  the setting to an installed `scan.conf` by hand, since the installer never
+  overwrites it, and run the installer again so the scheduled scan uses it.
+
 ## [0.2.4] - 2026-09-29
 
 ### Fixed

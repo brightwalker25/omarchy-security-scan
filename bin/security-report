@@ -34,6 +34,7 @@ from pathlib import Path
 
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/var/log/security-scan"))
 REGISTER = Path(os.environ.get("RISK_REGISTER", "/etc/security-scan/risk-register.toml"))
+SCAN_CONF = Path(os.environ.get("SCAN_CONF", "/etc/security-scan/scan.conf"))
 
 GREEN, AMBER, RED = "green", "amber", "red"
 # Grey is neutral: off, not installed, or not applicable. It never makes a
@@ -295,6 +296,26 @@ def _ln_commands(line):
     return commands
 
 
+def _ln_operands(args):
+    """(symbolic, operands) for the arguments of one ln command, or None when
+    it has an option this does not understand."""
+    symbolic, operands, opts_done = False, [], False
+    for a in args:
+        if opts_done or a == "-" or not a.startswith("-"):
+            operands.append(a)
+        elif a == "--":
+            opts_done = True
+        elif a.startswith("--"):
+            if a not in _LN_LONG:
+                return None
+            symbolic |= a == "--symbolic"
+        elif set(a[1:]) <= _LN_SHORT:
+            symbolic |= "s" in a
+        else:
+            return None
+    return symbolic, operands
+
+
 def scriptlet_link_target(script, link):
     """The file that `script` (a package's install script) makes `link` point
     at, fully resolved, or None when that cannot be told with certainty.
@@ -315,20 +336,10 @@ def scriptlet_link_target(script, link):
         for args in commands:
             if link not in args:
                 continue
-            symbolic, operands, opts_done = False, [], False
-            for a in args:
-                if opts_done or a == "-" or not a.startswith("-"):
-                    operands.append(a)
-                elif a == "--":
-                    opts_done = True
-                elif a.startswith("--"):
-                    if a not in _LN_LONG:
-                        return None
-                    symbolic |= a == "--symbolic"
-                elif set(a[1:]) <= _LN_SHORT:
-                    symbolic |= "s" in a
-                else:
-                    return None
+            parsed = _ln_operands(args)
+            if parsed is None:
+                return None
+            symbolic, operands = parsed
             if operands[-1] != link:
                 continue    # The link is the source here, not the link made.
             if len(operands) != 2 or not symbolic:
@@ -338,6 +349,23 @@ def scriptlet_link_target(script, link):
                 return None
             found.add(os.path.realpath(os.path.join(os.path.dirname(link), target)))
     return found.pop() if len(found) == 1 else None
+
+
+def _pacman_verifies(owner, target):
+    """True when pacman -Qkk finds no mismatch for `target` in package
+    `owner`."""
+    try:
+        checked = subprocess.run(["pacman", "-Qkk", owner], capture_output=True, text=True,
+                                 timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # The same mismatches the scanner counts; a bare mtime mismatch is harmless.
+    bad = re.compile(r"checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch"
+                     r"|UID mismatch|GID mismatch")
+    for out_line in (checked.stdout + checked.stderr).splitlines():
+        if f" {target} " in out_line and bad.search(out_line):
+            return False
+    return True
 
 
 def scriptlet_link_explains(line):
@@ -360,23 +388,117 @@ def scriptlet_link_explains(line):
     version = (_pacman("-Q", "--", owner) or "").split() if owner else []
     if len(version) != 2:
         return False
-    try:
-        checked = subprocess.run(["pacman", "-Qkk", owner], capture_output=True, text=True,
-                                 timeout=120)
-    except (OSError, subprocess.SubprocessError):
+    if not _pacman_verifies(owner, target):
         return False
-    # The same mismatches the scanner counts; a bare mtime mismatch is harmless.
-    bad = re.compile(r"checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch"
-                     r"|UID mismatch|GID mismatch")
-    for out_line in (checked.stdout + checked.stderr).splitlines():
-        if f" {target} " in out_line and bad.search(out_line):
-            return False
     try:
         script = Path(f"/var/lib/pacman/local/{owner}-{version[1]}/install").read_text()
     except OSError:
         return False
     want = scriptlet_link_target(script, path)
     return want is not None and want == target
+
+
+def _root_only(st):
+    """True when a file is owned by root and nobody else may write it, the
+    same test security-scan applies before it sources scan.conf."""
+    return st.st_uid == 0 and not st.st_mode & 0o022
+
+
+def listed_links(conf=SCAN_CONF):
+    """The SCRIPTLET_LINKS setting of scan.conf as {link path: package}.
+
+    The value must be written out literally: a variable, command substitution
+    or backslash anywhere in it, or a file that is not root's alone, gives an
+    empty list, so every link stays red. Entries that are not an absolute path,
+    an equals sign and a package name are skipped. The last assignment wins,
+    as it does when the file is sourced."""
+    try:
+        st = os.stat(conf)
+        lines = Path(conf).read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    if not _root_only(st):
+        return {}
+    value, i = "", 0
+    while i < len(lines):
+        m = re.match(r"\s*(?:export\s+)?SCRIPTLET_LINKS=(.*)$", lines[i])
+        i += 1
+        if not m:
+            continue
+        chunk = m.group(1)
+        while True:
+            # A quoted value may run over several lines.
+            try:
+                words = shlex.split(chunk, comments=True)
+                break
+            except ValueError:
+                if i >= len(lines):
+                    return {}
+                chunk += "\n" + lines[i]
+                i += 1
+        if len(words) > 1 or any(c in chunk for c in "$`\\"):
+            return {}
+        value = words[0] if words else ""
+    links = {}
+    for entry in value.split():
+        path, sep, pkg = entry.rpartition("=")
+        if (sep and path.startswith("/") and os.path.normpath(path) == path
+                and re.fullmatch(r"[a-z0-9@_+][a-z0-9@._+-]*", pkg)):
+            links[path] = pkg
+    return links
+
+
+def _ln_makes(script, link):
+    """True when `script` has an `ln -s TARGET LINK` command whose last
+    argument is exactly `link`, whatever TARGET is."""
+    text = re.sub(r"\\\n", " ", script)
+    for line in text.splitlines():
+        if not _names_exactly(line, link):
+            continue
+        for args in _ln_commands(line) or []:
+            if link not in args:
+                continue
+            parsed = _ln_operands(args)
+            if (parsed and parsed[0] and len(parsed[1]) == 2
+                    and parsed[1][-1] == link):
+                return True
+    return False
+
+
+def listed_link_package(path, links):
+    """The package a link listed in scan.conf's SCRIPTLET_LINKS belongs to,
+    or None. For a package whose install script picks the link's target at
+    run time, which scriptlet_link_target() rightly refuses to guess. All of
+    these must hold: the path is listed, and is a symlink rather than a file;
+    it resolves to a regular file owned by the listed package and no other;
+    pacman finds that file unaltered; and the package's install script has an
+    `ln -s` command whose last argument is exactly the path. security-scan
+    calls this through --listed-link, so both use this one check."""
+    pkg = links.get(path)
+    if not pkg or not os.path.islink(path):
+        return None
+    target = os.path.realpath(path)
+    if not os.path.isfile(target):
+        return None
+    if (_pacman("-Qqo", "--", target) or "").split() != [pkg]:
+        return None
+    version = (_pacman("-Q", "--", pkg) or "").split()
+    if len(version) != 2 or version[0] != pkg:
+        return None
+    if not _pacman_verifies(pkg, target):
+        return None
+    try:
+        script = Path(f"/var/lib/pacman/local/{pkg}-{version[1]}/install").read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return pkg if _ln_makes(script, path) else None
+
+
+def listed_link_explains(line, links):
+    """True when a RED unpackaged-file line is a link listed in scan.conf
+    that listed_link_package() accepts."""
+    m = re.match(r"(?:added|changed) (\S+) \(unpackaged file in a system code path\)$", line)
+    return bool(m and links and listed_link_package(m.group(1), links))
 
 
 def integrity(now, since):
@@ -386,10 +508,12 @@ def integrity(now, since):
         s.rating, s.headline = AMBER, "No AIDE result this period."
         return s
     reds, ambers, pkg = [], [], 0
+    links = listed_links()
     for when, p in recent:
         for line in read(p).splitlines():
             if line.startswith("RED ") and (hook_explains(line[4:])
-                                            or scriptlet_link_explains(line[4:])):
+                                            or scriptlet_link_explains(line[4:])
+                                            or listed_link_explains(line[4:], links)):
                 pkg += 1
             elif line.startswith("RED "):
                 reds.append((when, line[4:]))
@@ -931,7 +1055,18 @@ def main():
     # with one parser. Prints the resolved target, or exits 1.
     ap.add_argument("--scriptlet-link-target", nargs=2, metavar=("SCRIPT", "LINK"),
                     help=argparse.SUPPRESS)
+    # For security-scan: checks a link listed in scan.conf's SCRIPTLET_LINKS.
+    # Prints the package, or exits 1.
+    ap.add_argument("--listed-link", nargs=2, metavar=("CONF", "LINK"), help=argparse.SUPPRESS)
     a = ap.parse_args()
+
+    if a.listed_link:
+        conf, link = a.listed_link
+        pkg = listed_link_package(link, listed_links(conf))
+        if pkg is None:
+            return 1
+        print(pkg)
+        return 0
 
     if a.scriptlet_link_target:
         script, link = a.scriptlet_link_target

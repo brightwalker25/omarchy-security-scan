@@ -195,6 +195,14 @@ explains each change before it is reported:
   the install script only works out when it runs (held in a variable), or
   for which it names two different targets. The weekly report applies the
   same check to a red line logged before this rule existed.
+- Such a link whose target is held in a variable can be accepted on one
+  machine by listing it in `SCRIPTLET_LINKS` in `scan.conf`, with the package
+  whose files it may point to. Nothing is listed by default. A listed link is
+  a package change only while it is a symlink, not a file, and resolves to a
+  file owned by that package alone, pacman finds that file unaltered, and the
+  package's install script has an `ln -s` command for the link's exact path.
+  The weekly report applies the same check, through the same code, to a red
+  line logged before the link was listed.
 
 After each check it re-baselines, so the next run reports only what is new. The
 previous baseline is kept as `/var/lib/aide/aide.db.prev.gz`, and the logs keep

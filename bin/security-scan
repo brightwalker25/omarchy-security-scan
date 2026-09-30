@@ -339,6 +339,16 @@ aide)
     echo "$owner"
   }
 
+  # Links named in scan.conf's SCRIPTLET_LINKS, for a package whose install
+  # script picks the target at run time, which scriptlet_link cannot check.
+  # Off unless listed. security-report does the whole check, reading the list
+  # from the file itself and never from the environment, so the scan and the
+  # report agree. Prints the package.
+  listed_link() {
+    [ -z "$conf_error" ] && [ -L "$1" ] && [ -f "$report_bin" ] || return 1
+    python3 -I "$report_bin" --listed-link "$SCAN_CONF" "$1" 2>/dev/null
+  }
+
   # Package files that a local pacman hook deliberately rewrites. A browser's
   # policies.json gets telemetry and studies switched off after every browser
   # update, so it always fails pacman's checksum. It is explained only while
@@ -398,6 +408,8 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
       verdict="PKG ${what} ${path} (rebuilt by pacman's ${hook%.hook} hook)"
     elif link_pkg=$(scriptlet_link "$path") && [ -n "$link_pkg" ]; then
       verdict="PKG ${what} ${path} (link made by ${link_pkg}'s install script, to the file it names, which pacman verifies)"
+    elif link_pkg=$(listed_link "$path") && [ -n "$link_pkg" ]; then
+      verdict="PKG ${what} ${path} (link listed in scan.conf for ${link_pkg}, made by its install script, to a file pacman verifies)"
     else
       case "$path" in
         /boot/*)

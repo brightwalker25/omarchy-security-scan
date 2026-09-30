@@ -182,7 +182,7 @@ Everything lives in `/etc/security-scan`, owned by root.
 
 | File | Installed | Holds |
 |---|---|---|
-| `scan.conf` | once, never overwritten | the desktop user, the folder of repositories for gitleaks, the folders of model files |
+| `scan.conf` | once, never overwritten | the desktop user, the folder of repositories for gitleaks, the folders of model files, links to accept from install scripts |
 | `aide.conf` | generated on every install | what AIDE watches and ignores |
 | `gitleaks.toml` | once, never overwritten | extra gitleaks rules and allowlists |
 | `risk-register.toml` | once, never overwritten | your assessment of each known finding |
@@ -191,17 +191,19 @@ Everything lives in `/etc/security-scan`, owned by root.
 holds rkhunter exceptions for files that are known to be harmless on a stock
 Arch install.
 
-`scan.conf` sets three values:
+`scan.conf` sets four values:
 
 | Key | Default | Effect |
 |---|---|---|
 | `DESKTOP_USER` | the account that ran `sudo` | who is notified and may read the logs; the scans refuse to run without it rather than guess |
 | `SCAN_ROOT` | `~/Work` | gitleaks scans every repository whose `.git` folder is at most three levels below this |
 | `MODEL_ROOTS` | `~/AI ~/.cache/huggingface` | folders searched for model files, separated by spaces; folders that do not exist are skipped |
+| `SCRIPTLET_LINKS` | empty | `link=package` pairs, separated by spaces: symlinks a package's install script points at a file it picks at run time, which AIDE then treats as package changes while they pass the checks described in the README; read only from the file, never the environment |
 
 The installer writes the home folder out in full, since the scans run as root
 and `~` would mean root's home. A variable set in the environment overrides
-the file for that run.
+the file for that run, except `SCRIPTLET_LINKS`, which the weekly report also
+reads and so is taken from the file alone.
 
 `aide.conf` is generated from `system/aide.conf.in` in the checkout, with your
 home folder filled in, and is replaced every time the installer runs. If the
