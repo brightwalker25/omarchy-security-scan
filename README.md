@@ -174,7 +174,24 @@ explains each change before it is reported:
 - A package's configuration file that you have edited is amber.
 - A changed file under `/boot` is a package change if pacman installed,
   upgraded or removed anything since the last check, because that is when the
-  boot image is rebuilt. With no package change it is red.
+  boot image is rebuilt. With no package change it is red, with one
+  exception below.
+- limine-snapper-sync rewrites `/boot/limine.conf`, its `.old` copy and its
+  own `limine_history/snapshots.json` whenever snapper creates or removes a
+  snapshot, which happens on timers and around pacman runs that change no
+  package. Such a change is a package change only when limine-snapper-sync's
+  own program logged writing that file since the last check, at the time the
+  file was written, and the file differs from a trusted copy of
+  `limine.conf` only inside the Snapshots sub-menu. Every entry in that
+  sub-menu must boot a command line the trusted copy already boots, with
+  only the snapshot's own subvolume swapped in, and a kernel image the
+  trusted copy already boots. Any other difference, such as a changed kernel
+  command line, kernel or initramfs path, or a new entry, stays red. The
+  trusted copy is kept in `/var/lib/security-scan`, readable by root only,
+  and is refreshed after each check that finds nothing red under `/boot`.
+  Until the first check has made it, every such change stays red. The
+  weekly report cannot repeat this check for a red line logged earlier,
+  because it cannot read `/boot` or the trusted copy, so those stay red.
 - A file that no package owns is amber under `/usr/local`, `/opt`, `/etc`,
   `/root` and `/home`, where your own changes normally land, and red anywhere
   else, such as `/usr/bin` or `/usr/lib`.
