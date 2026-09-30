@@ -26,7 +26,27 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
   the setting to an installed `scan.conf` by hand, since the installer never
   overwrites it, and run the installer again so the scheduled scan uses it.
 
+### Fixed
+
+- AIDE no longer reports limine-snapper-sync's snapshot bookkeeping as red.
+  A change to `/boot/limine.conf`, `/boot/limine.conf.old` or
+  `limine_history/snapshots.json` with no package update is a package change
+  only when limine-snapper-sync's own program logged writing the file since
+  the last check, and the file differs from a trusted copy of `limine.conf`
+  only inside the Snapshots sub-menu, whose entries may boot only command
+  lines and kernel images the trusted copy already boots. A changed kernel
+  command line, kernel or initramfs path, or any other entry stays red. The
+  scan keeps the trusted copy in `/var/lib/security-scan`, readable by root
+  only, and refreshes it after each check that finds nothing red under
+  `/boot`; until the first check has made it, these changes stay red. The
+  check lives in security-report, and security-scan runs it through a hidden
+  `--limine-snapshot-change` option. The weekly report leaves red lines
+  logged earlier as they are, because it cannot read `/boot` or the trusted
+  copy. Run the installer again after upgrading, so the scheduled scan uses
+  the new rule.
+
 ## [0.2.4] - 2026-09-29
+
 
 ### Fixed
 
@@ -37,6 +57,7 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
   the latest one no longer shows, the headline now says so.
 
 ## [0.2.3] - 2026-09-27
+
 
 ### Fixed
 
@@ -85,6 +106,7 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 - The bar lock is now tinted green, amber or red to match the report, in
   place of the small dot on its corner. A report that could not be read shows
   amber rather than a grey dot.
+
 
 ### Fixed
 

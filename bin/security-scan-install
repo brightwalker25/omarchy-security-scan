@@ -164,9 +164,10 @@ if [ "$UNINSTALL" -eq 1 ]; then
   echo "  /etc/rkhunter.conf.local           rkhunter overrides"
   echo "  /var/log/security-scan             scan logs"
   echo "  /var/lib/aide                      AIDE baseline"
+  echo "  /var/lib/security-scan             trusted copy of limine.conf"
   echo "  ${TARGET_HOME}/.local/share/security-report   weekly HTML reports"
   echo "Delete them by hand if you no longer want them, for example:"
-  echo "  sudo rm -r ${ETC} /var/log/security-scan /var/lib/aide"
+  echo "  sudo rm -r ${ETC} /var/log/security-scan /var/lib/aide /var/lib/security-scan"
   echo "The packages (arch-audit, lynis, gitleaks, rkhunter, aide) were not removed."
   exit 0
 fi

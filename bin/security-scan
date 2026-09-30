@@ -257,6 +257,17 @@ aide)
     exit 0
   fi
 
+  # A copy of limine.conf taken before AIDE reads /boot. It becomes the
+  # trusted copy that limine_snapshot_change compares against, but only when
+  # this run finds nothing red under /boot and the file has not changed since.
+  limine_ref=/var/lib/security-scan/limine.conf
+  limine_new=""
+  if [ -f /boot/limine.conf ]; then
+    install -d -m 0700 /var/lib/security-scan
+    limine_new=$(mktemp /var/lib/security-scan/limine.conf.XXXXXX) &&
+      cp -f /boot/limine.conf "$limine_new" || limine_new=""
+  fi
+
   out=$(aide --update --no-progress --no-color -c "$AIDE_CONFIG" 2>&1)
   rc=$?
   # Exit codes 1, 2 and 4 are bits for added, removed and changed entries;
@@ -265,6 +276,7 @@ aide)
     log "!! aide failed (exit ${rc}):"
     log "$out"
     log "summary: error"
+    [ -n "$limine_new" ] && rm -f "$limine_new"
     notify critical "File integrity check failed" "aide exit ${rc}. See ${LOG}"
     prune
     exit 0
@@ -371,7 +383,24 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
     esac
   }
 
-  red=0 amber=0 pkg=0
+  # limine-snapper-sync rewrites limine.conf, its .old copy and its own
+  # snapshots.json whenever snapper creates or removes a snapshot, which
+  # happens on timers and around pacman runs that change no package. Such a
+  # change is explained only when that program logged writing the file since
+  # the last check and the file differs from the trusted copy of limine.conf
+  # only inside the Snapshots sub-menu, with nothing there the trusted copy
+  # does not already boot. A kernel command line, kernel or initramfs path or
+  # any other entry that differs stays red, and so does everything while
+  # there is no trusted copy yet. The check lives in security-report, which
+  # holds the one implementation; the report cannot repeat it for older RED
+  # lines, because /boot and the trusted copy are readable by root only.
+  limine_snapshot_change() {
+    [ -s "$limine_ref" ] && [ -f "$report_bin" ] || return 1
+    python3 -I "$report_bin" --limine-snapshot-change "$1" "$limine_ref" "$last_run" \
+      >/dev/null 2>&1
+  }
+
+  red=0 amber=0 pkg=0 boot_red=0
   while IFS= read -r line; do
     path="${line#*: }"
     kind="${line%%:*}"
@@ -415,8 +444,11 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
         /boot/*)
           if [ "${pacman_since:-0}" -gt 0 ]; then
             verdict="PKG ${what} ${path} (boot image rebuilt after a package update)"
+          elif limine_snapshot_change "$path"; then
+            verdict="PKG ${what} ${path} (snapshot menu rewritten by limine-snapper-sync, the rest matches the trusted copy)"
           else
             verdict="RED ${what} ${path} (boot file changed with no package update)"
+            boot_red=1
           fi
           ;;
         /usr/local/* | /opt/* | /etc/* | /root/* | /home/*)
@@ -435,6 +467,18 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
     esac
     log "$verdict"
   done < <(printf '%s\n' "$out" | grep -E '^[fdlbcps][^:]*: /')
+
+  # Keep the copy taken before the check as the trusted limine.conf only when
+  # nothing under /boot is red and the file is still what was copied. A run
+  # with a red keeps the old copy; like the AIDE baseline, the copy moves on
+  # at the next run that finds nothing red, so a red is reported once.
+  if [ -n "$limine_new" ]; then
+    if [ "$boot_red" -eq 0 ] && cmp -s "$limine_new" /boot/limine.conf; then
+      mv -f "$limine_new" "$limine_ref"
+    else
+      rm -f "$limine_new"
+    fi
+  fi
 
   if [ -s /var/lib/aide/aide.db.new.gz ]; then
     cp -f "$db" /var/lib/aide/aide.db.prev.gz
