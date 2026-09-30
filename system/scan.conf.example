@@ -17,3 +17,14 @@ SCAN_ROOT="@HOME@/Work"
 # Folders that do not exist are skipped, so it is safe to list ones you may
 # create later.
 MODEL_ROOTS="@HOME@/AI @HOME@/.cache/huggingface"
+
+# Symlinks that a package's install script points at a file it picks at run
+# time, such as the build for this CPU or graphics card, as link=package
+# pairs separated by spaces or new lines. AIDE reports a listed link as a
+# package change only while it is a symlink to a file of that package, pacman
+# finds that file unaltered, and the package's install script has an ln -s
+# command for that exact path. Anything else at that path stays red. Write
+# the value out in full; a variable or command in it empties the list. Read
+# only from this file, never the environment. Empty by default. For example:
+# SCRIPTLET_LINKS="/usr/bin/voxtype=voxtype-bin /usr/lib/voxtype/voxtype-onnx-cuda=voxtype-bin"
+SCRIPTLET_LINKS=""
