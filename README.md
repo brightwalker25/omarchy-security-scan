@@ -371,6 +371,7 @@ your home folder, `/etc` or the scan logs.
 | Key | Default | Effect |
 |---|---|---|
 | `refreshIntervalMs` | 300000 | How often the bar re-reads the report, between 30 seconds and an hour |
+| `reportDays` | 7 | How many days of scan results the bar and panel grade, from 1 to 7. Each scan's latest run always counts, even when it is older; the Monday report always covers seven days |
 | `hideWhenGreen` | false | Hide the lock when the report is green, so it shows only when it is amber or red |
 
 These affect only the widget. The scans run on their own timers whatever the

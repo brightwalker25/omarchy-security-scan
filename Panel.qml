@@ -51,6 +51,13 @@ Panel {
   }
 
   readonly property int refreshMs: Math.max(30000, Number(setting("refreshIntervalMs", 300000)))
+  // How far back the report looks. Anything outside 1 to 7, or not a whole
+  // number, falls back to the week the report was written for.
+  readonly property int reportDays: {
+    var d = Number(setting("reportDays", 7))
+    return (Number.isInteger(d) && d >= 1 && d <= 7) ? d : 7
+  }
+  onReportDaysChanged: root.poll()
 
   property var rep: null
   property string error: ""
@@ -75,8 +82,8 @@ Panel {
 
   readonly property string collectScript:
     'r=/usr/local/bin/security-report; ' +
-    'if [ -x "$r" ] && grep -q -- --json "$r"; then exec "$r" --json; fi; ' +
-    'exec "$1" --json'
+    'if [ -x "$r" ] && grep -q -- --json "$r"; then exec "$r" --json --days "$2"; fi; ' +
+    'exec "$1" --json --days "$2"'
 
   // The report exits 1 on red as well as on a crash, so the exit code cannot
   // say whether the page was written. The old page is removed first and the
@@ -85,7 +92,7 @@ Panel {
   readonly property string openScript:
     'r=/usr/local/bin/security-report; [ -x "$r" ] || r=$1; ' +
     'd="$HOME/.local/share/security-report"; out="$d/latest-widget.html"; ' +
-    'rm -f "$out"; "$r" --html "$out" >/dev/null 2>&1; ' +
+    'rm -f "$out"; "$r" --html "$out" --days "$2" >/dev/null 2>&1; ' +
     'if [ -s "$out" ]; then exec xdg-open "$out"; fi; ' +
     'exec xdg-open "$d/latest.html"'
 
@@ -97,7 +104,7 @@ Panel {
   }
 
   function openFullReport() {
-    Quickshell.execDetached(["sh", "-c", root.openScript, "sh", root.bundled])
+    Quickshell.execDetached(["sh", "-c", root.openScript, "sh", root.bundled, String(root.reportDays)])
     root.close()
   }
 
@@ -126,7 +133,7 @@ Panel {
 
   Process {
     id: proc
-    command: ["sh", "-c", root.collectScript, "sh", root.bundled]
+    command: ["sh", "-c", root.collectScript, "sh", root.bundled, String(root.reportDays)]
     running: false
     stdout: StdioCollector {
       waitForEnd: true

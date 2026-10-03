@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "brightwalker25.security-scan",
   "name": "Security Scan",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "author": "brightwalker25",
   "license": "MIT",
   "description": "The weekly security report in the bar: scan health, known vulnerabilities, file integrity, rootkits, leaked secrets and privacy, graded red, amber or green",
@@ -34,7 +34,8 @@
     "defaultSection": "right",
     "defaults": {
       "refreshIntervalMs": 300000,
-      "hideWhenGreen": false
+      "hideWhenGreen": false,
+      "reportDays": 7
     },
     "schema": [
       {
@@ -46,6 +47,16 @@
         "step": 30000,
         "defaultValue": 300000,
         "description": "How often the bar re-reads the report. This only reads stored scan results, so it is cheap. The scans themselves run on their own schedule."
+      },
+      {
+        "key": "reportDays",
+        "type": "integer",
+        "label": "Look back (days)",
+        "min": 1,
+        "max": 7,
+        "step": 1,
+        "defaultValue": 7,
+        "description": "How many days of scan results the bar and panel grade, from 1 to 7. A finding drops out once it is older than this. Each scan's latest run always counts, even when it is older. The weekly report on Monday always covers seven days."
       },
       {
         "key": "hideWhenGreen",

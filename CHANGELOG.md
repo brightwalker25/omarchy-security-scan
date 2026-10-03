@@ -6,6 +6,36 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-03
+
+### Added
+
+- A `reportDays` setting, from 1 to 7 and 7 by default, sets how many days of
+  scan results the bar and panel grade. A finding drops out of the bar once it
+  is older than that, instead of always waiting a full week. The Monday report
+  still covers seven days.
+
+### Changed
+
+- Each scan's latest run now always counts, even when it is older than the
+  window, so a short window does not turn a weekly scan such as rkhunter
+  amber for having no result. Whether a scan is overdue is still graded in
+  the scan health section. `--days` must be at least 1.
+
+### Fixed
+
+- A boot file changed by a package reinstall or downgrade was graded red as
+  "boot file changed with no package update", because the scan counted only
+  installs, upgrades and removals. A `reinstalled` or `downgraded` line in
+  `pacman.log` now counts too. The report applies the same rule to red lines
+  already logged: it reads that line as a package change when `pacman.log`
+  records a transaction between the end of the check before it and the start
+  of the check that logged it, comparing times with their zones so a change of
+  clocks cannot reorder them. A transaction made while or after that check
+  ran, or a later check's verdict, never clears it. Each check now logs the
+  window its own count used, and the report uses that when it is there. Run
+  the installer again so the scheduled scan uses the new rule.
+
 ## [0.2.5] - 2026-09-30
 
 ### Added

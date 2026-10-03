@@ -35,6 +35,7 @@ from pathlib import Path
 LOG_DIR = Path(os.environ.get("LOG_DIR", "/var/log/security-scan"))
 REGISTER = Path(os.environ.get("RISK_REGISTER", "/etc/security-scan/risk-register.toml"))
 SCAN_CONF = Path(os.environ.get("SCAN_CONF", "/etc/security-scan/scan.conf"))
+PACMAN_LOG = Path(os.environ.get("PACMAN_LOG", "/var/log/pacman.log"))
 
 GREEN, AMBER, RED = "green", "amber", "red"
 # Grey is neutral: off, not installed, or not applicable. It never makes a
@@ -94,6 +95,11 @@ def logs(mode, since):
     out.sort()
     recent = [(w, p) for w, p in out if w >= since]
     latest = out[-1] if out else None
+    # A window shorter than a scan's cadence (one day against a weekly
+    # rkhunter) would otherwise read as "no result". The latest run always
+    # counts; whether it is overdue is the scan health section's call.
+    if not recent and latest:
+        recent = [latest]
     return recent, latest
 
 
@@ -716,16 +722,93 @@ def limine_snapshot_change(path, reference_path, since):
     return _snapshots_json_ok(text, reference)
 
 
+BOOT_NO_PACKAGE = "(boot file changed with no package update)"
+_PACMAN_CHANGE = re.compile(r"^\[(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d[+-]\d{4})\] \[ALPM\] "
+                            r"(?:upgraded|installed|removed|reinstalled|downgraded) ")
+
+
+def _stamp(text):
+    """An ISO time with its zone (pacman's +0100 or an AIDE log's +01:00) as
+    an aware datetime, or None."""
+    try:
+        d = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return d if d.tzinfo else None
+
+
+def _logged(pattern, text):
+    m = re.search(pattern, text, re.M)
+    return _stamp(m.group(1)) if m else None
+
+
+def pacman_changed(start, end, log=None):
+    """True when pacman.log records a package installed, upgraded, removed,
+    reinstalled or downgraded between `start` and `end`, both aware, so a
+    change of clocks cannot reorder them."""
+    if log is None:
+        try:
+            log = PACMAN_LOG.read_text(errors="replace")
+        except OSError:
+            return False
+    for line in log.splitlines():
+        m = _PACMAN_CHANGE.match(line)
+        when = _stamp(m.group(1)) if m else None
+        if when and start <= when <= end:
+            return True
+    return False
+
+
+def boot_explained_by_pacman(when, path, runs, log=None):
+    """True when the AIDE run logged at `when` (whose log is `path`) had a
+    package transaction since the run before it. security-scan grades a boot
+    change after one as a package change, but before 0.2.6 it missed
+    reinstalls and downgrades, so this re-applies the rule to lines it logged
+    red. It vouches only for the run the line came from; a later run says
+    nothing about an earlier change.
+
+    A run since 0.2.6 logs the window its count used. For an older one, the
+    window runs from the end of the run before to the start of this one,
+    which is never wider than what the scan saw: a transaction made while it
+    ran may have come after AIDE read the file, so it does not count."""
+    text = read(path)
+    m = re.search(r"^pacman window: (\S+) to (\S+)$", text, re.M)
+    if m:
+        start, end = _stamp(m.group(1)), _stamp(m.group(2))
+    else:
+        earlier = [(w, p) for w, p in runs if w < when]
+        if not earlier:
+            return False
+        prev = read(earlier[-1][1])
+        start = (_logged(r"^=== done at (\S+) ===$", prev)
+                 or _logged(r"^=== \S+ run at (\S+) ===$", prev))
+        end = _logged(r"^=== \S+ run at (\S+) ===$", text)
+    if start is None or end is None:
+        return False
+    return pacman_changed(start, end, log)
+
+
 def integrity(now, since):
     s = Section("System file integrity (AIDE)", GREEN, "")
     recent, _ = logs("aide", since)
     if not recent:
-        s.rating, s.headline = AMBER, "No AIDE result this period."
+        s.rating, s.headline = AMBER, "No AIDE result yet."
         return s
     reds, ambers, pkg = [], [], 0
     links = listed_links()
+    runs, _ = logs("aide", dt.datetime.min)
+    pacman_log = None
     for when, p in recent:
         for line in read(p).splitlines():
+            if line.startswith("RED ") and line.endswith(BOOT_NO_PACKAGE):
+                if pacman_log is None:
+                    try:
+                        pacman_log = PACMAN_LOG.read_text(errors="replace")
+                    except OSError:
+                        pacman_log = ""
+                if boot_explained_by_pacman(when, p, runs, pacman_log):
+                    pkg += 1
+                    continue
             # A red limine.conf or snapshots.json line is not re-read with
             # limine_snapshot_change: the report cannot read /boot or the
             # trusted copy, and neither is what it was when the line was logged.
@@ -770,7 +853,7 @@ def rootkit(now, since):
     s = Section("Rootkit check (rkhunter)", GREEN, "")
     recent, _ = logs("rkhunter", since)
     if not recent:
-        s.rating, s.headline = AMBER, "No rkhunter result this period."
+        s.rating, s.headline = AMBER, "No rkhunter result yet."
         return s
     # Grade the latest run only. rkhunter checks the whole system each time,
     # so a clean run supersedes the warnings of the runs before it; counting
@@ -803,7 +886,7 @@ def models(now, since):
     s = Section("AI model files", GREEN, "")
     recent, latest = logs("models", since)
     if not recent:
-        s.rating, s.headline = AMBER, "No model scan this period."
+        s.rating, s.headline = AMBER, "No model scan yet."
         return s
     dangerous = suspicious = 0
     for when, p in recent:
@@ -1263,7 +1346,8 @@ li {{ display:flex; gap:10px; padding:10px 0; border-top:1px solid var(--line); 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--days", type=int, default=7,
+                    help="look back N days, at least 1 (default 7)")
     ap.add_argument("--plain", action="store_true")
     ap.add_argument("--all", action="store_true", help="list green items too")
     ap.add_argument("--html", metavar="FILE")
@@ -1281,6 +1365,8 @@ def main():
     ap.add_argument("--limine-snapshot-change", nargs=3, metavar=("PATH", "REFERENCE", "SINCE"),
                     help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if a.days < 1:
+        ap.error("--days must be at least 1")
 
     if a.listed_link:
         conf, link = a.listed_link

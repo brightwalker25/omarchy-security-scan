@@ -286,9 +286,15 @@ aide)
   # pacman owns and still verifies byte-for-byte is explained; anything else
   # under a code path is not. Changed config and user persistence files are
   # listed for a human to confirm.
+  # A reinstall or downgrade runs the same hooks as an upgrade, so it counts
+  # too; leaving it out made a keyring reinstall's boot menu rewrite red.
+  # security-report applies the same rule to RED lines logged before this.
+  # The window is logged so security-report can re-read a red line against
+  # exactly the transactions this count saw.
   last_run=$(stat -c %Y "$db" 2>/dev/null || echo 0)
+  log "pacman window: $(date -d "@${last_run}" -Is) to $(date -Is)"
   pacman_since=$(awk -v t="$(date -d "@${last_run}" '+%Y-%m-%dT%H:%M:%S')" \
-    '/\[ALPM\] (upgraded|installed|removed)/ { ts=substr($1,2,19); if (ts >= t) n++ } END { print n+0 }' \
+    '/\[ALPM\] (upgraded|installed|removed|reinstalled|downgraded) / { ts=substr($1,2,19); if (ts >= t) n++ } END { print n+0 }' \
     /var/log/pacman.log 2>/dev/null)
 
   declare -A pkg_bad=()

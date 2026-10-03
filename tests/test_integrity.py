@@ -12,6 +12,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -569,6 +570,158 @@ class LimineSnapshotCommandTest(unittest.TestCase):
 
     def test_a_bad_time_exits_1(self):
         self.assertEqual(self.run_option("/boot/limine.conf", "/nonexistent", "soon"), 1)
+
+
+class WindowTest(unittest.TestCase):
+    """A window shorter than a scan's cadence still grades its latest run."""
+
+    def setUp(self):
+        self.r = load_report()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        patcher = mock.patch.object(self.r, "LOG_DIR", self.dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write(self, name, text="summary: 0 warning(s)\n"):
+        (self.dir / name).write_text(text)
+
+    def test_latest_run_counts_when_older_than_window(self):
+        self.write("rkhunter-20260928-184922.log")
+        since = self.r.dt.datetime(2026, 10, 2)
+        recent, latest = self.r.logs("rkhunter", since)
+        self.assertEqual(recent, [latest])
+        self.assertEqual(latest[0], self.r.dt.datetime(2026, 9, 28, 18, 49, 22))
+
+    def test_older_runs_drop_out_when_window_has_one(self):
+        self.write("aide-20260929-193307.log", "RED changed /boot/limine.conf\nsummary: 1 unexplained\n")
+        self.write("aide-20261002-185919.log", "summary: 0 unexplained\n")
+        since = self.r.dt.datetime(2026, 10, 1)
+        recent, _ = self.r.logs("aide", since)
+        self.assertEqual([w.day for w, _ in recent], [2])
+
+    def test_no_logs_at_all(self):
+        self.assertEqual(self.r.logs("rkhunter", self.r.dt.datetime(2026, 10, 2)), ([], None))
+
+
+
+PREV_RUN = ("=== aide run at 2026-09-28T19:05:35+01:00 ===\n"
+            "summary: 0 unexplained, 0 to confirm, 0 from package updates\n"
+            "=== done at 2026-09-28T19:08:10+01:00 ===\n")
+BOOT_RED = ("=== aide run at 2026-09-29T19:33:07+01:00 ===\n"
+            "RED changed /boot/limine.conf (boot file changed with no package update)\n"
+            "summary: 1 unexplained, 0 to confirm, 0 from package updates\n"
+            "=== done at 2026-09-29T19:33:58+01:00 ===\n")
+
+
+class BootRedPacmanTest(unittest.TestCase):
+    """A boot red logged when a package transaction had in fact run since the
+    previous check, which the scanner missed for reinstalls before 0.2.6."""
+
+    def setUp(self):
+        self.r = load_report()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        (self.dir / "logs").mkdir()
+        (self.dir / "logs/aide-20260928-190535.log").write_text(PREV_RUN)
+        (self.dir / "logs/aide-20260929-193307.log").write_text(BOOT_RED)
+        for name, value in (("LOG_DIR", self.dir / "logs"), ("PACMAN_LOG", self.dir / "pacman.log"),
+                            ("SCAN_CONF", self.dir / "scan.conf")):
+            patcher = mock.patch.object(self.r, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def grade(self, pacman):
+        (self.dir / "pacman.log").write_text(pacman)
+        return self.r.integrity(self.r.dt.datetime(2026, 10, 3), self.r.dt.datetime(2026, 9, 26))
+
+    def test_reinstall_between_runs_explains_it(self):
+        s = self.grade("[2026-09-29T18:13:08+0100] [ALPM] reinstalled archlinux-keyring (20260902-1)\n")
+        self.assertEqual(s.rating, self.r.GREEN)
+
+    def test_downgrade_explains_it(self):
+        s = self.grade("[2026-09-29T10:00:00+0100] [ALPM] downgraded foo (2-1 -> 1-1)\n")
+        self.assertEqual(s.rating, self.r.GREEN)
+
+    def test_no_transaction_stays_red(self):
+        s = self.grade("[2026-09-29T18:13:08+0100] [ALPM] running '30-systemd-daemon-reload-system.hook'...\n")
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_transaction_before_previous_run_ended_stays_red(self):
+        s = self.grade("[2026-09-28T19:00:00+0100] [ALPM] upgraded foo (1-1 -> 2-1)\n")
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_transaction_after_the_run_stays_red(self):
+        # A later package update says nothing about the change already logged.
+        s = self.grade("[2026-09-30T12:00:00+0100] [ALPM] upgraded foo (1-1 -> 2-1)\n")
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_transaction_while_the_run_was_going_stays_red(self):
+        # AIDE may already have read the file by then.
+        s = self.grade("[2026-09-29T19:33:30+0100] [ALPM] upgraded foo (1-1 -> 2-1)\n")
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_clocks_going_back_do_not_reorder(self):
+        # 01:30+0000 on 25 Oct is 45 minutes after a run that started at
+        # 01:45+01:00, though it reads earlier as plain text.
+        (self.dir / "logs/aide-20261024-190000.log").write_text(
+            PREV_RUN.replace("2026-09-28", "2026-10-24"))
+        (self.dir / "logs/aide-20261025-014500.log").write_text(
+            BOOT_RED.replace("2026-09-29T19:33:07+01:00", "2026-10-25T01:45:00+01:00")
+                    .replace("2026-09-29T19:33:58+01:00", "2026-10-25T01:46:00+01:00"))
+        (self.dir / "pacman.log").write_text("[2026-10-25T01:30:00+0000] [ALPM] upgraded foo (1-1 -> 2-1)\n")
+        s = self.r.integrity(self.r.dt.datetime(2026, 10, 26), self.r.dt.datetime(2026, 10, 25))
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_logged_window_is_used_when_present(self):
+        windowed = BOOT_RED.replace(
+            "RED changed", "pacman window: 2026-09-29T19:00:00+01:00 to 2026-09-29T19:34:00+01:00\nRED changed")
+        (self.dir / "logs/aide-20260929-193307.log").write_text(windowed)
+        self.assertEqual(self.grade("[2026-09-29T18:13:08+0100] [ALPM] reinstalled k (1-1)\n").rating,
+                         self.r.RED)
+        self.assertEqual(self.grade("[2026-09-29T19:33:30+0100] [ALPM] reinstalled k (1-1)\n").rating,
+                         self.r.GREEN)
+
+    def test_no_earlier_run_stays_red(self):
+        (self.dir / "logs/aide-20260928-190535.log").unlink()
+        s = self.grade("[2026-09-29T18:13:08+0100] [ALPM] reinstalled archlinux-keyring (20260902-1)\n")
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_unreadable_pacman_log_stays_red(self):
+        s = self.r.integrity(self.r.dt.datetime(2026, 10, 3), self.r.dt.datetime(2026, 9, 26))
+        self.assertEqual(s.rating, self.r.RED)
+
+    def test_other_red_reasons_are_not_touched(self):
+        (self.dir / "logs/aide-20260929-193307.log").write_text(
+            BOOT_RED.replace("(boot file changed with no package update)",
+                             "(unpackaged file in a system code path)").replace("/boot/limine.conf", "/usr/bin/x"))
+        s = self.grade("[2026-09-29T18:13:08+0100] [ALPM] reinstalled archlinux-keyring (20260902-1)\n")
+        self.assertEqual(s.rating, self.r.RED)
+
+
+class ScannerPacmanPatternTest(unittest.TestCase):
+    """The scanner's awk count of package transactions, run on a sample log."""
+
+    def count(self, log, since="2026-09-28T19:08:10"):
+        src = (ROOT / "bin/security-scan").read_text()
+        prog = re.search(r"'(/\\\[ALPM\\\] \(upgraded[^']*)'", src).group(1)
+        with tempfile.NamedTemporaryFile("w", suffix=".log") as f:
+            f.write(log)
+            f.flush()
+            out = subprocess.run(["awk", "-v", f"t={since}", prog, f.name],
+                                 capture_output=True, text=True, check=True).stdout
+        return int(out)
+
+    def test_counts_reinstall_and_downgrade(self):
+        log = ("[2026-09-29T18:13:08+0100] [ALPM] reinstalled archlinux-keyring (20260902-1)\n"
+               "[2026-09-29T18:14:00+0100] [ALPM] downgraded foo (2-1 -> 1-1)\n"
+               "[2026-09-29T18:15:00+0100] [ALPM] upgraded bar (1-1 -> 2-1)\n"
+               "[2026-09-29T18:16:00+0100] [ALPM] running 'x.hook'...\n"
+               "[2026-09-27T18:16:00+0100] [ALPM] installed old (1-1)\n")
+        self.assertEqual(self.count(log), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
