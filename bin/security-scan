@@ -347,7 +347,7 @@ aide)
     owner=$(pacman -Qqo -- "$target" 2>/dev/null | head -1)
     [ -n "$owner" ] || return 1
     pkg_checked "$owner"
-    printf '%s\n' "${pkg_bad[$owner]}" | grep -qF " ${target} " && return 1
+    grep -qF " ${target} " <<<"${pkg_bad[$owner]}" && return 1
     ver=$(pacman -Q -- "$owner" 2>/dev/null | awk '{ print $2 }')
     script="/var/lib/pacman/local/${owner}-${ver}/install"
     [ -n "$ver" ] && [ -f "$script" ] && [ -f "$report_bin" ] || return 1
@@ -365,6 +365,16 @@ aide)
   listed_link() {
     [ -z "$conf_error" ] && [ -L "$1" ] && [ -f "$report_bin" ] || return 1
     python3 -I "$report_bin" --listed-link "$SCAN_CONF" "$1" 2>/dev/null
+  }
+
+  # Files a package's own install script hands to a group of its own with
+  # the setgid bit (1password's browser helper, its op CLI). pacman's file
+  # list keeps the packaged group and mode, so pacman reports a GID and
+  # permissions mismatch on every update. security-report does the whole
+  # check, so the scan and the report agree. Prints the package.
+  scriptlet_setgid() {
+    [ -f "$report_bin" ] || return 1
+    python3 -I "$report_bin" --scriptlet-setgid "$1" 2>/dev/null
   }
 
   # Package files that a local pacman hook deliberately rewrites. A browser's
@@ -424,11 +434,19 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
     verdict=""
     if [ -n "$owner" ] && [ "$what" != removed ]; then
       pkg_checked "$owner"
-      if printf '%s\n' "${pkg_bad[$owner]}" | grep -qF " ${path} " &&
+      # Here-strings, not printf | grep -q: under pipefail an early match
+      # on long output kills printf and reads as no match.
+      if grep -qF " ${path} " <<<"${pkg_bad[$owner]}" &&
         hook=$(hook_rewrote "$path") && [ -n "$hook" ]; then
         verdict="PKG ${what} ${path} (${owner}, privacy switches added by the ${hook} hook)"
-      elif printf '%s\n' "${pkg_bad[$owner]}" | grep -qF " ${path} "; then
+      elif grep -qF " ${path} " <<<"${pkg_bad[$owner]}" &&
+        sg=$(scriptlet_setgid "$path") && [ -n "$sg" ]; then
+        verdict="PKG ${what} ${path} (${owner}, group and setgid bit set by its install script)"
+      elif grep -F " ${path} " <<<"${pkg_bad[$owner]}" |
+        grep -vE '\((GID|Permissions) mismatch\)$' >/dev/null; then
         verdict="RED ${what} ${path} (owned by ${owner} but fails pacman's checksum)"
+      elif grep -qF " ${path} " <<<"${pkg_bad[$owner]}"; then
+        verdict="RED ${what} ${path} (owned by ${owner} but fails pacman's ownership or permission check)"
       elif pacman -Qii "$owner" 2>/dev/null |
         awk -v p="$path" '($1 == "MODIFIED" || $1 == "UNMODIFIED") && $2 == p { f = 1 } END { exit !f }'; then
         verdict="AMBER ${what} ${path} (config file of ${owner}, edited locally)"
@@ -513,9 +531,14 @@ rkhunter)
   unverified=""
   for f in $changed; do
     owner=$(pacman -Qqo "$f" 2>/dev/null | head -1)
-    if [ -n "$owner" ] && ! pacman -Qkk "$owner" 2>&1 |
-      grep -E 'checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch|UID mismatch|GID mismatch' |
-      grep -qF " ${f} "; then
+    bad=""
+    [ -n "$owner" ] && bad=$(pacman -Qkk "$owner" 2>&1 |
+      grep -E 'checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch|UID mismatch|GID mismatch')
+    if [ -n "$owner" ] && ! grep -qF " ${f} " <<<"$bad"; then
+      accepted=$((accepted + 1))
+    elif [ -n "$owner" ] && python3 -I "$(dirname -- "$(readlink -f -- "$0")")/security-report" \
+      --scriptlet-setgid "$f" >/dev/null 2>&1; then
+      # Its install script set the group and setgid bit, see scriptlet_setgid.
       accepted=$((accepted + 1))
     else
       unverified="${unverified}${f} "

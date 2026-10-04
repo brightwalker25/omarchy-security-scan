@@ -6,6 +6,34 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-10-04
+
+### Fixed
+
+- A package file whose own install script gives it a group and the setgid
+  bit no longer turns the integrity check red after every update of that
+  package. 1password does this to its browser helper and 1password-cli to
+  `op`, so pacman reports a GID and permissions mismatch on files whose
+  content is untouched. Such a file is now a package change only when pacman
+  finds nothing else wrong with it, the install script plainly runs `chgrp`
+  and `chmod g+s` on that exact path, and the file's group, owner and mode
+  match what the script and the package say. The script's `chgrp` and
+  `chmod` must be certain to run: text in a heredoc, a function nothing
+  calls, or a command inside an `if` or after `&&` does not count. The
+  rootkit check accepts the same files. Red lines logged before this
+  version are not re-graded and age out of the window as usual.
+- The report no longer accepts a linked file as verified when it runs as a
+  user who cannot read the file. pacman then prints "failed to calculate"
+  instead of a checksum mismatch, which the check had not looked for.
+- A mismatch line early in a very long pacman listing could be missed,
+  because `printf | grep -q` under pipefail reads an early match as no
+  match. The scan now matches against the text directly.
+
+### Changed
+
+- A package file that fails only pacman's ownership or permission check is
+  now reported as that, instead of as failing pacman's checksum.
+
 ## [0.2.6] - 2026-10-03
 
 ### Added

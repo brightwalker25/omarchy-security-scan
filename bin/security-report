@@ -21,12 +21,15 @@ reads any other Black Ops file and never runs Black Ops.
 
 import argparse
 import datetime as dt
+import grp
+import gzip
 import html
 import json
 import os
 import pwd
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import tomllib
@@ -269,9 +272,10 @@ _LN_LONG = {"--symbolic", "--force", "--no-dereference", "--relative", "--verbos
 _LN_LEAD = {"then", "do", "else", "{", "!", "command"}
 
 
-def _ln_commands(line):
-    """The ln commands on one line of shell, each as its list of arguments,
-    or None when the line cannot be split into words."""
+def _shell_commands(line):
+    """The simple commands on one line of shell, each as its list of words
+    with the command name first, or None when the line cannot be split into
+    words."""
     lex = shlex.shlex(line, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = "#"
@@ -294,12 +298,21 @@ def _ln_commands(line):
                 continue
             while words and words[0] in _LN_LEAD:
                 words.pop(0)
-            if words and (words[0] == "ln" or words[0].endswith("/ln")):
-                commands.append(words[1:])
+            if words:
+                commands.append(words)
             words = []
         else:
             words.append(tok)
     return commands
+
+
+def _ln_commands(line):
+    """The ln commands on one line of shell, each as its list of arguments,
+    or None when the line cannot be split into words."""
+    commands = _shell_commands(line)
+    if commands is None:
+        return None
+    return [w[1:] for w in commands if w[0] == "ln" or w[0].endswith("/ln")]
 
 
 def _ln_operands(args):
@@ -369,7 +382,8 @@ def _pacman_verifies(owner, target):
     bad = re.compile(r"checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch"
                      r"|UID mismatch|GID mismatch")
     for out_line in (checked.stdout + checked.stderr).splitlines():
-        if f" {target} " in out_line and bad.search(out_line):
+        if f" {target} " in out_line and (bad.search(out_line)
+                                          or "failed to calculate" in out_line):
             return False
     return True
 
@@ -402,6 +416,232 @@ def scriptlet_link_explains(line):
         return False
     want = scriptlet_link_target(script, path)
     return want is not None and want == target
+
+
+_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.S)
+_VAR_REF = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$")
+
+
+_FUNC_DEF = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{?\s*$")
+_OPEN_BLOCK = {"if", "while", "until", "for", "case", "select"}
+_CLOSE_BLOCK = {"fi", "done", "esac"}
+_UNSAFE = "$`*?[]{}~\\"
+
+
+def _sure_commands(script):
+    """The commands of an install script that certainly run when pacman calls
+    post_install or post_upgrade, as lists of words, and every command, or
+    None when the script is not plain enough to tell.
+
+    A command certainly runs when it sits at the top level of the script or
+    of a function reached from those two by plain calls, outside any if, case
+    or loop, and not after && or ||. Functions must be written
+    `name() {` on a line of their own at the start of the line and close with
+    `}` at the start of a line. A heredoc gives None, since its body is text
+    that looks like commands."""
+    if "<<" in script:
+        return None
+    text = re.sub(r"\\\n", " ", script)
+    functions, top, current = {}, [], None
+    for line in text.splitlines():
+        m = _FUNC_DEF.match(line)
+        if m:
+            if current is not None:
+                return None
+            current = functions.setdefault(m.group(1), [])
+            if not line.rstrip().endswith("{"):
+                return None
+            continue
+        if re.match(r"\s*(?:function\s|[A-Za-z_][A-Za-z0-9_]*\s*\(\))", line):
+            return None    # A function written some other way.
+        if line.startswith("}"):
+            if current is None or line.strip() != "}":
+                return None
+            current = None
+            continue
+        commands = _shell_commands(line)
+        if commands is None:
+            return None
+        guarded = "&&" in line or "||" in line
+        (top if current is None else current).append((commands, guarded))
+    if current is not None:
+        return None
+
+    def walk(body):
+        """(words, sure) for each command in a body, tracking block depth."""
+        depth = 0
+        for commands, guarded in body:
+            for words in commands:
+                if words[0] in _CLOSE_BLOCK:
+                    depth -= 1
+                yield words, depth == 0 and not guarded
+                if words[0] in _OPEN_BLOCK:
+                    depth += 1
+
+    reached, todo = set(), [f for f in ("post_install", "post_upgrade") if f in functions]
+    bodies = [top]
+    while todo:
+        name = todo.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        bodies.append(functions[name])
+        for words, sure in walk(functions[name]):
+            if sure and words[0] in functions:
+                todo.append(words[0])
+    sure_cmds = [w for body in bodies for w, sure in walk(body) if sure]
+    every = [w for body in [top, *functions.values()] for w, _ in walk(body)]
+    return sure_cmds, every
+
+
+def scriptlet_setgid_group(script, path):
+    """The group that `script` (a package's install script) gives `path`
+    together with the setgid bit, or None when that cannot be told with
+    certainty.
+
+    Some packages hand a binary to a group of its own after installing it, so
+    only that group's members can talk to it: 1password runs
+    `chgrp onepassword` and `chmod g+s` on its browser helper. pacman's file
+    list still holds the packaged group and mode, so pacman -Qkk reports a GID
+    and permissions mismatch for a file whose content is untouched.
+
+    Every chgrp, chmod and chown command must be one this can read: plain
+    words, or a variable given exactly one literal value and never changed
+    any other way. Those naming `path` must be `chgrp GROUP PATH` and
+    `chmod g+s PATH` with no options, each certain to run (_sure_commands),
+    at least one of each, with the chgrps agreeing and no chown. Anything
+    else gives None, so the file stays red."""
+    parsed = _sure_commands(script)
+    if parsed is None:
+        return None
+    sure_cmds, every = parsed
+
+    values = {}
+    for words in every:
+        if words[0] in ("local", "export", "readonly", "declare") and len(words) == 2:
+            words = words[1:]
+        m = _ASSIGN.match(words[0])
+        if not m or len(words) != 1:
+            continue
+        name, value = m.groups()
+        literal = value and not any(c in value for c in _UNSAFE)
+        if not literal or values.get(name, value) != value:
+            values[name] = None
+        else:
+            values[name] = value
+
+    def resolve(word):
+        if not any(c in word for c in _UNSAFE):
+            return word
+        m = _VAR_REF.match(word)
+        if not m:
+            return None
+        name = m.group(1) or m.group(2)
+        # Only `NAME=` may mention the name bare; `NAME+=`, `for NAME`,
+        # `read NAME` or `printf -v NAME` change it in ways not tracked here.
+        for hit in re.finditer(rf"(?<![A-Za-z0-9_$\{{]){name}(?![A-Za-z0-9_])", script):
+            if not script.startswith("=", hit.end()):
+                return None
+        return values.get(name)
+
+    groups, setgid = set(), 0
+    sure_ids = {id(w) for w in sure_cmds}
+    for words in every:
+        cmd = words[0].rsplit("/", 1)[-1]
+        if cmd not in ("chgrp", "chmod", "chown"):
+            continue
+        args = [resolve(w) for w in words[1:]]
+        if None in args:
+            return None
+        if path not in args:
+            continue
+        if args[-1] != path or len(args) != 2 or id(words) not in sure_ids:
+            return None
+        if cmd == "chgrp" and not args[0].startswith("-"):
+            groups.add(args[0])
+        elif cmd == "chmod" and args[0] == "g+s":
+            setgid += 1
+        else:
+            return None
+    if len(groups) != 1 or not setgid:
+        return None
+    return groups.pop()
+
+
+def _mtree_entry(owner, version, path):
+    """The keywords (mode, uid, gid and so on) of `path` in the package's
+    mtree file, with /set defaults applied, or None when it is not there."""
+    try:
+        with gzip.open(f"/var/lib/pacman/local/{owner}-{version}/mtree", "rt",
+                       errors="replace") as f:
+            lines = f.read().splitlines()
+    except (OSError, EOFError):
+        return None
+    want = "." + path
+    defaults = {}
+    for line in lines:
+        parts = line.split()
+        if not parts or parts[0].startswith("#"):
+            continue
+        keywords = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+        if parts[0] == "/set":
+            defaults.update(keywords)
+        elif parts[0] == "/unset":
+            for k in parts[1:]:
+                defaults.pop(k, None)
+        elif re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[0]) == want:
+            return {**defaults, **keywords}
+    return None
+
+
+def scriptlet_setgid(path):
+    """The package whose install script explains a GID and permissions
+    mismatch on `path`, or None.
+
+    pacman must report nothing for the file but a GID or permissions
+    mismatch, so its content, size and owner are as packaged. The install
+    script must give it a group and the setgid bit (scriptlet_setgid_group),
+    the file must now be in that group, and its mode must be the packaged
+    mode plus setgid and nothing else. security-scan calls this through
+    --scriptlet-setgid, so both use this one check."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        return None
+    owner = (_pacman("-Qqo", "--", path) or "").split("\n")[0].strip()
+    version = (_pacman("-Q", "--", owner) or "").split() if owner else []
+    if len(version) != 2:
+        return None
+    try:
+        checked = subprocess.run(["pacman", "-Qkk", owner], capture_output=True, text=True,
+                                 timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Anything pacman says about the file but a group, mode or time mismatch
+    # rules it out. Run as a user who cannot read the file, pacman prints
+    # "failed to calculate SHA256 checksum" rather than a checksum mismatch,
+    # so a list of bad messages to look for would let that through.
+    said = [l for l in (checked.stdout + checked.stderr).splitlines() if f" {path} " in l]
+    if any(not re.search(r"\((?:GID|Permissions|Modification time) mismatch\)$", l)
+           for l in said):
+        return None
+    if not any(re.search(r"\((?:GID|Permissions) mismatch\)$", l) for l in said):
+        return None
+    try:
+        group = scriptlet_setgid_group(
+            Path(f"/var/lib/pacman/local/{owner}-{version[1]}/install").read_text(), path)
+    except (OSError, UnicodeDecodeError):
+        return None
+    entry = _mtree_entry(owner, version[1], path)
+    if group is None or entry is None:
+        return None
+    try:
+        st = os.stat(path)
+        mode, uid = int(entry["mode"], 8), int(entry["uid"])
+        now_group = grp.getgrgid(st.st_gid).gr_name
+    except (OSError, KeyError, ValueError):
+        return None
+    if now_group != group or st.st_uid != uid or stat.S_IMODE(st.st_mode) != mode | stat.S_ISGID:
+        return None
+    return owner
 
 
 def _root_only(st):
@@ -1360,6 +1600,9 @@ def main():
     # For security-scan: checks a link listed in scan.conf's SCRIPTLET_LINKS.
     # Prints the package, or exits 1.
     ap.add_argument("--listed-link", nargs=2, metavar=("CONF", "LINK"), help=argparse.SUPPRESS)
+    # For security-scan: checks a file whose install script gives it a group
+    # and the setgid bit. Prints the package, or exits 1.
+    ap.add_argument("--scriptlet-setgid", metavar="PATH", help=argparse.SUPPRESS)
     # For security-scan: exits 0 when a changed boot file is only
     # limine-snapper-sync's snapshot bookkeeping, see limine_snapshot_change.
     ap.add_argument("--limine-snapshot-change", nargs=3, metavar=("PATH", "REFERENCE", "SINCE"),
@@ -1371,6 +1614,13 @@ def main():
     if a.listed_link:
         conf, link = a.listed_link
         pkg = listed_link_package(link, listed_links(conf))
+        if pkg is None:
+            return 1
+        print(pkg)
+        return 0
+
+    if a.scriptlet_setgid:
+        pkg = scriptlet_setgid(a.scriptlet_setgid)
         if pkg is None:
             return 1
         print(pkg)

@@ -723,5 +723,202 @@ class ScannerPacmanPatternTest(unittest.TestCase):
         self.assertEqual(self.count(log), 3)
 
 
+HELPER = "/opt/App/app-helper"
+SETGID_SCRIPT = f"""GROUP_NAME="appgroup"
+
+setup_helper() {{
+    HELPER_PATH="{HELPER}"
+    chgrp "${{GROUP_NAME}}" $HELPER_PATH
+    chmod g+s $HELPER_PATH
+}}
+
+post_upgrade() {{
+    setup_helper
+}}
+"""
+
+
+class ScriptletSetgidGroupTest(unittest.TestCase):
+    def setUp(self):
+        self.r = load_report()
+
+    def group(self, script, path=HELPER):
+        return self.r.scriptlet_setgid_group(script, path)
+
+    def test_variables_set_once_are_resolved(self):
+        self.assertEqual(self.group(SETGID_SCRIPT), "appgroup")
+
+    def test_literal_words_are_read(self):
+        self.assertEqual(self.group(f"chgrp appgroup {HELPER}\nchmod g+s {HELPER}\n"), "appgroup")
+
+    def test_chgrp_without_setgid_is_not(self):
+        self.assertIsNone(self.group(f"chgrp appgroup {HELPER}\n"))
+
+    def test_setgid_without_chgrp_is_not(self):
+        self.assertIsNone(self.group(f"chmod g+s {HELPER}\n"))
+
+    def test_any_other_chmod_is_not(self):
+        self.assertIsNone(self.group(f"chgrp appgroup {HELPER}\nchmod 4755 {HELPER}\n"))
+        self.assertIsNone(self.group(f"chgrp appgroup {HELPER}\nchmod g+s,u+s {HELPER}\n"))
+
+    def test_a_chown_is_not(self):
+        self.assertIsNone(self.group(
+            f"chgrp appgroup {HELPER}\nchmod g+s {HELPER}\nchown nobody {HELPER}\n"))
+
+    def test_two_groups_are_not(self):
+        self.assertIsNone(self.group(
+            f"chgrp appgroup {HELPER}\nchgrp wheel {HELPER}\nchmod g+s {HELPER}\n"))
+
+    def test_options_are_not(self):
+        self.assertIsNone(self.group(f"chgrp -h appgroup {HELPER}\nchmod g+s {HELPER}\n"))
+
+    def test_a_variable_set_twice_is_not(self):
+        self.assertIsNone(self.group('G="appgroup"\nG="wheel"\n' + f"chgrp $G {HELPER}\nchmod g+s {HELPER}\n"))
+
+    def test_a_computed_variable_is_not(self):
+        self.assertIsNone(self.group('G=$(id -gn)\n' + f"chgrp $G {HELPER}\nchmod g+s {HELPER}\n"))
+
+    def test_an_unknown_operand_anywhere_is_not(self):
+        # It could name the file, so the whole script is unreadable.
+        self.assertIsNone(self.group(
+            f"chgrp appgroup {HELPER}\nchmod g+s {HELPER}\nchmod 4755 $ELSEWHERE\n"))
+
+    def test_a_glob_is_not(self):
+        self.assertIsNone(self.group("chgrp appgroup /opt/App/*\nchmod g+s /opt/App/*\n"))
+
+    def test_another_file_is_not(self):
+        self.assertIsNone(self.group(SETGID_SCRIPT, "/opt/App/other"))
+
+    def test_a_commented_out_command_is_ignored(self):
+        self.assertIsNone(self.group(f"# chgrp appgroup {HELPER}\nchmod g+s {HELPER}\n"))
+
+    def test_text_in_a_heredoc_is_not(self):
+        self.assertIsNone(self.group(
+            f"cat <<EOF\n  chgrp appgroup {HELPER}\n  chmod g+s {HELPER}\nEOF\n"))
+
+    def test_a_function_nothing_calls_is_not(self):
+        self.assertIsNone(self.group(
+            f"unused() {{\n  chgrp appgroup {HELPER}\n  chmod g+s {HELPER}\n}}\n"))
+
+    def test_a_one_line_function_is_not(self):
+        self.assertIsNone(self.group(f"f() {{ chgrp appgroup {HELPER}; chmod g+s {HELPER}; }}\n"))
+
+    def test_inside_an_if_is_not(self):
+        self.assertIsNone(self.group(
+            f"post_install() {{\n  if false; then\n    chgrp appgroup {HELPER}\n"
+            f"    chmod g+s {HELPER}\n  fi\n}}\n"))
+        self.assertIsNone(self.group(
+            f"if false; then chgrp appgroup {HELPER}; chmod g+s {HELPER}; fi\n"))
+
+    def test_after_and_or_or_is_not(self):
+        self.assertIsNone(self.group(f"true && chgrp appgroup {HELPER}\nchmod g+s {HELPER}\n"))
+
+    def test_after_a_closed_if_is_explained(self):
+        self.assertEqual(self.group(
+            f"post_install() {{\n  if true; then\n    groupadd appgroup\n  fi\n"
+            f"  chgrp appgroup {HELPER}\n  chmod g+s {HELPER}\n}}\n"), "appgroup")
+
+    def test_a_variable_changed_another_way_is_not(self):
+        for change in ("G+=x", "for G in wheel; do :; done", "read G", "printf -v G wheel"):
+            self.assertIsNone(self.group(
+                f"G=appgroup\n{change}\nchgrp $G {HELPER}\nchmod g+s {HELPER}\n"), change)
+
+    def test_the_real_1password_scripts_are_read(self):
+        for pkg, path, group in (("1password", "/opt/1Password/1Password-BrowserSupport", "onepassword"),
+                                 ("1password-cli", "/usr/bin/op", "onepassword-cli")):
+            found = list(Path("/var/lib/pacman/local").glob(f"{pkg}-[0-9]*/install"))
+            if not found:
+                self.skipTest(f"{pkg} not installed")
+            self.assertEqual(self.group(found[0].read_text(), path), group)
+
+
+class ScriptletSetgidTest(unittest.TestCase):
+    def setUp(self):
+        self.r = load_report()
+
+    def explains(self, qkk=f"warning: app: {HELPER} (GID mismatch)\n"
+                          f"warning: app: {HELPER} (Permissions mismatch)\n",
+                 script=SETGID_SCRIPT, group="appgroup", mode=0o2755, uid=0,
+                 mtree={"mode": "755", "uid": "0", "gid": "0"}, islink=False):
+        def pacman(*args):
+            return {"-Qqo": "app\n", "-Q": "app 1.0-1\n"}[args[0]]
+
+        st = mock.Mock(st_uid=uid, st_gid=1001, st_mode=0o100000 | mode)
+        done = subprocess.CompletedProcess([], 0, stdout="", stderr=qkk)
+        with mock.patch.object(self.r.os.path, "islink", return_value=islink), \
+             mock.patch.object(self.r.os.path, "isfile", return_value=True), \
+             mock.patch.object(self.r, "_pacman", side_effect=pacman), \
+             mock.patch.object(self.r.subprocess, "run", return_value=done), \
+             mock.patch.object(self.r.Path, "read_text", return_value=script), \
+             mock.patch.object(self.r, "_mtree_entry", return_value=mtree), \
+             mock.patch.object(self.r.os, "stat", return_value=st), \
+             mock.patch.object(self.r.grp, "getgrgid", return_value=mock.Mock(gr_name=group)):
+            return self.r.scriptlet_setgid(HELPER) == "app"
+
+    def test_group_and_setgid_from_the_install_script_are_explained(self):
+        self.assertTrue(self.explains())
+
+    def test_a_time_mismatch_alongside_is_explained(self):
+        self.assertTrue(self.explains(qkk=f"warning: app: {HELPER} (GID mismatch)\n"
+                                          f"warning: app: {HELPER} (Modification time mismatch)\n"))
+
+    def test_a_checksum_pacman_could_not_calculate_is_not(self):
+        # What pacman prints when run as a user who cannot read the file.
+        self.assertFalse(self.explains(
+            qkk=f"warning: app: {HELPER} (Permissions mismatch)\n"
+                f"warning: app: {HELPER} (failed to calculate SHA256 checksum)\n"))
+
+    def test_a_checksum_mismatch_is_not(self):
+        self.assertFalse(self.explains(qkk=f"warning: app: {HELPER} (GID mismatch)\n"
+                                           f"warning: app: {HELPER} (SHA256 checksum mismatch)\n"))
+
+    def test_a_uid_mismatch_is_not(self):
+        self.assertFalse(self.explains(qkk=f"warning: app: {HELPER} (UID mismatch)\n"))
+
+    def test_no_mismatch_is_not(self):
+        self.assertFalse(self.explains(qkk=""))
+
+    def test_another_group_is_not(self):
+        self.assertFalse(self.explains(group="wheel"))
+
+    def test_setuid_as_well_is_not(self):
+        self.assertFalse(self.explains(mode=0o6755))
+
+    def test_group_write_as_well_is_not(self):
+        self.assertFalse(self.explains(mode=0o2775))
+
+    def test_another_owner_is_not(self):
+        self.assertFalse(self.explains(uid=1000))
+
+    def test_a_file_not_in_the_mtree_is_not(self):
+        self.assertFalse(self.explains(mtree=None))
+
+    def test_a_link_is_not(self):
+        self.assertFalse(self.explains(islink=True))
+
+    def test_a_script_that_does_not_explain_it_is_not(self):
+        self.assertFalse(self.explains(script=f"chmod g+s {HELPER}\n"))
+
+
+
+class MtreeEntryTest(unittest.TestCase):
+    def test_defaults_and_overrides(self):
+        r = load_report()
+        import gzip as gz
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "app-1.0-1"
+            root.mkdir()
+            with gz.open(root / "mtree", "wt") as f:
+                f.write("#mtree\n/set type=file uid=0 gid=0 mode=644\n/set mode=755\n"
+                        "./opt/App/app\\040helper time=1 size=2\n./opt/App/data mode=600\n")
+            real_open = gz.open
+            with mock.patch.object(r.gzip, "open",
+                                   side_effect=lambda p, *a, **k: real_open(
+                                       str(p).replace("/var/lib/pacman/local", d), *a, **k)):
+                self.assertEqual(r._mtree_entry("app", "1.0-1", "/opt/App/app helper")["mode"], "755")
+                self.assertEqual(r._mtree_entry("app", "1.0-1", "/opt/App/data")["mode"], "600")
+                self.assertIsNone(r._mtree_entry("app", "1.0-1", "/opt/App/missing"))
+
+
 if __name__ == "__main__":
     unittest.main()
