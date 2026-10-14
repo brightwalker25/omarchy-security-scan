@@ -6,6 +6,31 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-10-14
+
+### Security
+
+- The gitleaks scan put the path of each repository with findings in its
+  desktop notification. `notify-send` takes the notification text as a
+  command-line argument, which any local user can read in the process list,
+  so repository names and their finding counts were visible outside the
+  protected scan logs. The notification now gives only the counts and the log
+  path, and the log alone names the repositories.
+- gitleaks itself was started with each repository's path on its command
+  line, which exposed the same names while it ran. It now runs from inside
+  the repository and is given `.`, so no repository path appears in any
+  command line the scan starts.
+
+### Changed
+
+- Because gitleaks now scans `.`, an allowlist `paths` pattern in
+  `/etc/security-scan/gitleaks.toml` is matched against the path relative to
+  the repository root. A pattern that names the repository folder no longer
+  matches; drop the folder from it. See INSTALL.md.
+- For the same reason, a `.gitleaksignore` fingerprint now names the file
+  relative to the repository root, as one committed in a repository usually
+  does. An entry written with the full path no longer matches.
+
 ## [0.2.8] - 2026-10-12
 
 ### Added

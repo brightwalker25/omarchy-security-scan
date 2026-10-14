@@ -148,7 +148,10 @@ gitleaks)
   findings=0
   repos=0
   flagged=0
-  scanned=""
+
+  # The scan runs from inside each repository, so a relative path given in
+  # the environment must be resolved first.
+  GITLEAKS_CONFIG=$(realpath -m -- "$GITLEAKS_CONFIG")
 
   # gitleaks renamed its scan verbs at 8.19: "dir" replaced "detect --no-git".
   # Pick whichever this build understands so a package upgrade can't quietly
@@ -160,16 +163,20 @@ gitleaks)
   fi
 
   while IFS= read -r gitdir; do
-    repo=$(dirname "$gitdir")
+    # Parameter expansion, not dirname: an external command would show the
+    # path in the process list.
+    repo=${gitdir%/.git}
     repos=$((repos + 1))
     report=$(mktemp)
 
-    gl_scan "$repo" \
+    # Scan from inside the repo, so its path never appears in gitleaks'
+    # command line, which any local user can read in the process list.
+    (cd "$repo" 2>/dev/null || exit 2; gl_scan . \
       --config "$GITLEAKS_CONFIG" \
       --report-format json \
       --report-path "$report" \
       --redact \
-      --no-banner >>"$LOG" 2>&1
+      --no-banner) >>"$LOG" 2>&1
     rc=$?
 
     n=""
@@ -186,7 +193,6 @@ gitleaks)
     if [ "$n" -gt 0 ]; then
       findings=$((findings + n))
       flagged=$((flagged + 1))
-      scanned="${scanned}${repo}: ${n}"$'\n'
       log ""
       log "--- ${repo}: ${n} finding(s) ---"
       cat "$report" >>"$LOG"
@@ -198,8 +204,10 @@ gitleaks)
   log "summary: ${findings} finding(s) across ${repos} repo(s)"
 
   if [ "$findings" -gt 0 ]; then
+    # Counts only. notify-send takes the body as an argument, which any
+    # local user can read in the process list, so repo names stay in the log.
     notify critical "Secrets found in ${flagged} of ${repos} repo(s)" \
-      "${findings} finding(s). See ${LOG}"$'\n'"${scanned}"
+      "${findings} finding(s). See ${LOG}"
   fi
   ;;
 

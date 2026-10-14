@@ -249,6 +249,13 @@ matching line, so that a real secret in the same place is still reported.
 Replace the placeholder name in the installed copy only, never in a file you
 commit.
 
+An allowlist `paths` pattern is matched against the file's path relative to
+the root of the repository being scanned, such as `data/signatures.toml`, not
+against its full path. Before 0.2.9 the full path was used, so a pattern that
+names the repository folder, such as `my-repo/data/signatures\.toml$`, no
+longer matches. Drop the folder name from it, and keep the rule and line
+conditions so the entry stays narrow.
+
 ### Writing a risk register entry
 
 The register has four kinds of entry. The installed copy contains one example

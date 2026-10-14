@@ -24,7 +24,8 @@ useDefault = true
 # folder where it occurs, and where possible to the text on the matching line,
 # so that a real secret in the same place is still reported. When a new match
 # turns out to be a false positive, add an entry like these rather than
-# deleting a rule.
+# deleting a rule. A `paths` pattern is matched against the path relative to
+# the root of the repository, so it cannot name the repository folder.
 #
 # Python byte-code caches are generated locally and never committed, but they
 # embed the absolute path of the source file, which a private-name rule
