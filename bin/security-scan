@@ -84,6 +84,19 @@ LOG="$LOG_DIR/${MODE}-$(date +%Y%m%d-%H%M%S).log"
 
 log() { printf '%s\n' "$*" >>"$LOG"; }
 
+# True for a path inside the desktop user's home folder. An external command
+# given such a path shows it (a private key's file name, say) to every local
+# user through the process list, so these paths are only ever handled with
+# shell builtins. A home folder of / would match everything, so it never does.
+home_prefix=${user_home%/}
+in_home() {
+  [ -n "$home_prefix" ] || return 1
+  case "$1" in
+    "$home_prefix" | "$home_prefix"/*) return 0 ;;
+  esac
+  return 1
+}
+
 # Findings that only reach the journal are findings nobody reads, so speak to
 # the graphical session when there is one. Silently skipped on a headless boot;
 # the log is still written either way.
@@ -152,6 +165,10 @@ gitleaks)
   # The scan runs from inside each repository, so a relative path given in
   # the environment must be resolved first.
   GITLEAKS_CONFIG=$(realpath -m -- "$GITLEAKS_CONFIG")
+  # Without its config gitleaks fails on every repo; say why once.
+  if [ ! -f "$GITLEAKS_CONFIG" ] || [ ! -r "$GITLEAKS_CONFIG" ]; then
+    log "!! gitleaks config ${GITLEAKS_CONFIG} is missing or unreadable"
+  fi
 
   # gitleaks renamed its scan verbs at 8.19: "dir" replaced "detect --no-git".
   # Pick whichever this build understands so a package upgrade can't quietly
@@ -171,8 +188,11 @@ gitleaks)
 
     # Scan from inside the repo, so its path never appears in gitleaks'
     # command line, which any local user can read in the process list.
+    # gitleaks exits 1 both for leaks and for fatal errors such as a missing
+    # config, so leaks are given exit 3 and a 1 means the scan failed.
     (cd "$repo" 2>/dev/null || exit 2; gl_scan . \
       --config "$GITLEAKS_CONFIG" \
+      --exit-code 3 \
       --report-format json \
       --report-path "$report" \
       --redact \
@@ -186,7 +206,7 @@ gitleaks)
 
     n=${n:-0}
 
-    if [ "$rc" -gt 1 ]; then
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
       log "!! gitleaks errored on ${repo} (exit ${rc})"
     fi
 
@@ -352,6 +372,8 @@ aide)
     local path="$1" target owner ver script want
     [ -L "$path" ] || return 1
     target=$(readlink -f -- "$path") && [ -f "$target" ] || return 1
+    # A target in the home folder has no owner and must not reach pacman.
+    in_home "$target" && return 1
     owner=$(pacman -Qqo -- "$target" 2>/dev/null | head -1)
     [ -n "$owner" ] || return 1
     pkg_checked "$owner"
@@ -371,7 +393,11 @@ aide)
   # from the file itself and never from the environment, so the scan and the
   # report agree. Prints the package.
   listed_link() {
+    local target
     [ -z "$conf_error" ] && [ -L "$1" ] && [ -f "$report_bin" ] || return 1
+    # security-report asks pacman who owns the target; one in the home folder
+    # has no owner and must not reach that command line.
+    target=$(readlink -f -- "$1") && ! in_home "$target" || return 1
     python3 -I "$report_bin" --listed-link "$SCAN_CONF" "$1" 2>/dev/null
   }
 
@@ -438,7 +464,15 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
     # those files are reported on their own.
     [ -d "$path" ] && [ "$what" != removed ] && continue
 
-    owner=$(pacman -Qqo "$path" 2>/dev/null | head -1)
+    # No package owns files in the home folder, so its paths skip pacman and
+    # the link checks, which would show them in the process list, and get
+    # the verdict those give an unpackaged file.
+    owner="" home=0
+    if in_home "$path"; then
+      home=1
+    else
+      owner=$(pacman -Qqo "$path" 2>/dev/null | head -1)
+    fi
     verdict=""
     if [ -n "$owner" ] && [ "$what" != removed ]; then
       pkg_checked "$owner"
@@ -467,9 +501,9 @@ sys.exit(0 if ok else 1)' "$1" 2>/dev/null && echo zen-privacy-policy ;;
       verdict="PKG ${what} ${path} (${owner}, removed by package change)"
     elif hook=$(rebuild_hook "$path") && [ -n "$hook" ] && hook_wrote "$hook" "$path"; then
       verdict="PKG ${what} ${path} (rebuilt by pacman's ${hook%.hook} hook)"
-    elif link_pkg=$(scriptlet_link "$path") && [ -n "$link_pkg" ]; then
+    elif [ "$home" -eq 0 ] && link_pkg=$(scriptlet_link "$path") && [ -n "$link_pkg" ]; then
       verdict="PKG ${what} ${path} (link made by ${link_pkg}'s install script, to the file it names, which pacman verifies)"
-    elif link_pkg=$(listed_link "$path") && [ -n "$link_pkg" ]; then
+    elif [ "$home" -eq 0 ] && link_pkg=$(listed_link "$path") && [ -n "$link_pkg" ]; then
       verdict="PKG ${what} ${path} (link listed in scan.conf for ${link_pkg}, made by its install script, to a file pacman verifies)"
     else
       case "$path" in
@@ -538,7 +572,10 @@ rkhunter)
   changed=$(printf '%s\n' "$out" | awk '/file properties have changed/{f=1; next} /^Warning:/{f=0} f && /File: /{print $2}')
   unverified=""
   for f in $changed; do
-    owner=$(pacman -Qqo "$f" 2>/dev/null | head -1)
+    # A home folder file, if rkhunter is set to watch one, has no package to
+    # verify it and must not reach a command line; it stays unverified.
+    owner=""
+    in_home "$f" || owner=$(pacman -Qqo "$f" 2>/dev/null | head -1)
     bad=""
     [ -n "$owner" ] && bad=$(pacman -Qkk "$owner" 2>&1 |
       grep -E 'checksum mismatch|Size mismatch|Symlink path mismatch|Permissions mismatch|UID mismatch|GID mismatch')
@@ -582,7 +619,11 @@ models)
     # Python environments hold library test fixtures, not models, and flood
     # the scan with parse warnings. Supply-chain risk in pip packages is a
     # different problem this scan does not claim to cover.
-    out=$(picklescan -p "$root" --exclude-dir "$SKIP_DIRS" 2>&1)
+    # Scan from inside the folder, so its path stays out of the command line,
+    # which any local user can read in the process list for the whole scan.
+    # picklescan still prints full paths, which go only to the log.
+    out=$(cd -- "$root" 2>/dev/null || { echo "cannot enter the folder"; exit 2; }
+      picklescan -p . --exclude-dir "$SKIP_DIRS" 2>&1)
     log "--- ${root} ---"
     log "$out"
     # A crash mid-scan prints a traceback and no summary. That is a failed
@@ -595,8 +636,10 @@ models)
     scanned=$((scanned + $(printf '%s\n' "$out" | awk -F': ' '/^Scanned files/{print $2+0}')))
     dangerous=$((dangerous + $(printf '%s\n' "$out" | awk -F': ' '/^Dangerous globals/{print $2+0}')))
     suspicious=$((suspicious + $(printf '%s\n' "$out" | awk -F': ' '/^Suspicious globals/{print $2+0}')))
-    pickles=$((pickles + $(find -L "$root" -type d -regextype posix-extended -regex ".*/${SKIP_DIRS}" -prune -o \
-      -type f \( -iname '*.ckpt' -o -iname '*.pt' -o -iname '*.pth' -o -iname '*.bin' -o -iname '*.pkl' -o -iname '*.pickle' \) -print 2>/dev/null | wc -l)))
+    # Counted from inside the folder too, for the same reason.
+    n=$(cd -- "$root" 2>/dev/null && find -L . -type d -regextype posix-extended -regex ".*/${SKIP_DIRS}" -prune -o \
+      -type f \( -iname '*.ckpt' -o -iname '*.pt' -o -iname '*.pth' -o -iname '*.bin' -o -iname '*.pkl' -o -iname '*.pickle' \) -print 2>/dev/null | wc -l)
+    pickles=$((pickles + ${n:-0}))
   done
 
   log ""

@@ -20,7 +20,8 @@ trap 'rm -rf "$WORK"' EXIT
 SB="$WORK/sb"
 STUB="$WORK/stub"
 # Every release of this plugin whose installer is in the git history.
-RELEASES=(v021:fc8cc3d v022:79c0c2e v023:de1c328 v024:0f64334 v025:c467467 v026:3f1f7d3 v027:bdf26c8)
+RELEASES=(v021:fc8cc3d v022:79c0c2e v023:de1c328 v024:0f64334 v025:c467467 v026:3f1f7d3 v027:bdf26c8
+  v028:534b5dd v029:16d6f9c)
 
 pass=0 fail=0
 ok() { pass=$((pass + 1)); printf 'ok    %s\n' "$1"; }
@@ -144,6 +145,7 @@ out_has() { grep -qF -- "$1" "$WORK/out"; }
 called() { grep -qF -- "$1" "$SB/calls.log"; }
 not_called() { ! grep -qF -- "$1" "$SB/calls.log"; }
 mode_of() { stat -c %a "$1"; }
+ME=$(id -un)
 shipped() { # unit name -> path of the copy in this checkout
   case "$1" in
     security-report.*) echo "$REPO/system/user/$1" ;;
@@ -199,6 +201,17 @@ check "fresh install links picklescan into it" test "$(readlink "$BIN/picklescan
 check "fresh install writes the configuration" \
   bash -c "[ -f '$ETC/scan.conf' ] && [ -f '$ETC/aide.conf' ] && [ -f '$ETC/gitleaks.toml' ] && [ -f '$ETC/risk-register.toml' ] && [ -f '$RKH' ]"
 check "fresh rkhunter.conf.local mode is 640" test "$(mode_of "$RKH")" = 640
+# Only the scans, as root, read gitleaks.toml and aide.conf. The report runs
+# as the desktop user and reads the risk register and scan.conf through the
+# user's own group. chown is stubbed, so the group shows in its call log.
+check "fresh gitleaks.toml mode is 600" test "$(mode_of "$ETC/gitleaks.toml")" = 600
+check "fresh aide.conf mode is 600" test "$(mode_of "$ETC/aide.conf")" = 600
+check "fresh risk-register.toml mode is 640" test "$(mode_of "$ETC/risk-register.toml")" = 640
+check "fresh scan.conf mode is 640" test "$(mode_of "$ETC/scan.conf")" = 640
+check "fresh risk-register.toml is given to the desktop user's group" \
+  called "chown root:$ME $ETC/.risk-register.toml."
+check "fresh scan.conf is given to the desktop user's group" called "chown root:$ME $ETC/.scan.conf."
+check "fresh gitleaks.toml stays in root's group" called "chown root:root $ETC/.gitleaks.toml."
 for t in "${TIMERS[@]}"; do check "fresh install enables security-scan-$t.timer" called "systemctl enable --now security-scan-$t.timer"; done
 check "fresh install enables the report timer" called "systemctl --global enable security-report.timer"
 check "fresh install leaves no temporary files" no_temp_files
@@ -359,6 +372,93 @@ check "earlier backup of the same day is not overwritten" grep -qx 'older backup
 check "the hand-edited aide.conf is backed up with mode 600" \
   bash -c "grep -qx 'admin aide rules' '$ETC/aide.conf.bak-$(date +%Y%m%d).1' && [ \"\$(stat -c %a '$ETC/aide.conf.bak-$(date +%Y%m%d).1')\" = 600 ]"
 
+# ------------------------------------------------------------ private configuration
+# Configuration that earlier versions left readable by everyone is made
+# private on upgrade, by taking permissions away and never adding any.
+reset
+mkdir -p "$ETC"
+for f in gitleaks.toml risk-register.toml scan.conf aide.conf.bak-20260101; do
+  echo "old $f" >"$ETC/$f"
+  chmod 644 "$ETC/$f"
+done
+echo "admin's own" >"$ETC/aide.conf.bak-20260102"
+chmod 400 "$ETC/aide.conf.bak-20260102"
+echo "mine" >"$RKH"
+chmod 644 "$RKH"
+run "$NEW"
+rc=$?
+check "upgrade over open configuration succeeds" test $rc -eq 0
+check "open gitleaks.toml becomes 600, content kept" \
+  bash -c "grep -qx 'old gitleaks.toml' '$ETC/gitleaks.toml' && [ \"\$(stat -c %a '$ETC/gitleaks.toml')\" = 600 ]"
+check "open risk-register.toml becomes 640" test "$(mode_of "$ETC/risk-register.toml")" = 640
+check "open scan.conf becomes 640" test "$(mode_of "$ETC/scan.conf")" = 640
+check "an old aide.conf backup becomes 600" test "$(mode_of "$ETC/aide.conf.bak-20260101")" = 600
+check "a backup made more private by hand keeps mode 400" test "$(mode_of "$ETC/aide.conf.bak-20260102")" = 400
+check "rkhunter.conf.local, which may be the administrator's, is not changed" test "$(mode_of "$RKH")" = 644
+check "the change is shown" out_has "make $ETC/risk-register.toml private (mode 0644 to 0640)"
+run "$NEW"
+check "a second run changes no mode" bash -c "! grep -q 'private (mode' '$WORK/out'"
+
+# A file an administrator made more private is not opened up for the report.
+reset
+mkdir -p "$ETC"
+echo "mine" >"$ETC/risk-register.toml"
+chmod 600 "$ETC/risk-register.toml"
+run "$NEW"
+check "a risk register made 600 by hand stays 600" test "$(mode_of "$ETC/risk-register.toml")" = 600
+check "a risk register made 600 by hand keeps its group" not_called "chown root:$ME $ETC/risk-register.toml"
+
+# A symlink is never followed: neither it nor its target changes.
+reset
+mkdir -p "$ETC"
+for f in gitleaks.toml risk-register.toml; do
+  echo "elsewhere $f" >"$SB/elsewhere-$f"
+  chmod 644 "$SB/elsewhere-$f"
+  ln -s "$SB/elsewhere-$f" "$ETC/$f"
+done
+before=$(snapshot)
+run "$NEW"
+rc=$?
+check "symlinked gitleaks.toml and risk register: install still succeeds" test $rc -eq 0
+for f in gitleaks.toml risk-register.toml; do
+  check "symlinked $f: target keeps mode 644" test "$(mode_of "$SB/elsewhere-$f")" = 644
+  check "symlinked $f: still a link to the same place" test "$(readlink "$ETC/$f")" = "$SB/elsewhere-$f"
+  check "symlinked $f: left with a reason" out_has "left $ETC/$f as it is (a symlink)"
+  check "symlinked $f: listed for the administrator" out_has "$ETC/$f was left as it is, because it is a symlink"
+  check "symlinked $f: no chown through it" not_called "$ETC/$f"
+done
+
+# A file owned by another account is not changed. Ownership needs a second
+# account, so this part runs in a user namespace, where the sandbox's files
+# belong to root and uid 1 is someone else. chmod is real there, so a change
+# would show.
+ns() { unshare --map-auto --map-root-user "$@"; }
+if ns true 2>/dev/null; then
+  reset
+  mkdir -p "$ETC"
+  for f in gitleaks.toml risk-register.toml scan.conf; do
+    echo "old $f" >"$ETC/$f"
+    chmod 644 "$ETC/$f"
+  done
+  ns chown 1:1 "$ETC/gitleaks.toml"
+  ns env PATH="$STUB:$PATH" SUDO_USER="$ME" ROOT_UID_OVERRIDE=0 \
+    bash "$NEW" >"$WORK/out" 2>"$WORK/err"
+  rc=$?
+  check "gitleaks.toml owned by another account: install still succeeds" test $rc -eq 0
+  check "gitleaks.toml owned by another account: mode unchanged" test "$(mode_of "$ETC/gitleaks.toml")" = 644
+  check "gitleaks.toml owned by another account: left with a reason" \
+    out_has "left $ETC/gitleaks.toml as it is (not owned by root)"
+  check "gitleaks.toml owned by another account: no chown" not_called "$ETC/gitleaks.toml"
+  check "root's risk register in root's group: given to the desktop user's group" \
+    called "chown root:$ME $ETC/risk-register.toml"
+  check "root's risk register in root's group: mode 640" test "$(mode_of "$ETC/risk-register.toml")" = 640
+  check "root's scan.conf in root's group: given to the desktop user's group" \
+    called "chown root:$ME $ETC/scan.conf"
+  ns rm -f "$ETC/gitleaks.toml"
+else
+  echo "skip  ownership checks: no user namespace with a second id"
+fi
+
 # ------------------------------------------------------------ upgrades
 for r in "${RELEASES[@]}"; do
   v=${r%%:*}
@@ -376,6 +476,11 @@ for r in "${RELEASES[@]}"; do
   check "upgrade from $v: no uv tool folder left" absent "$OPT/tools"
   check "upgrade from $v: timers enabled" called "systemctl enable --now security-scan-models.timer"
   check "upgrade from $v: nothing refused" test ! -s "$WORK/err"
+  check "upgrade from $v: gitleaks.toml made private, mode 600" test "$(mode_of "$ETC/gitleaks.toml")" = 600
+  check "upgrade from $v: aide.conf made private, mode 600" test "$(mode_of "$ETC/aide.conf")" = 600
+  check "upgrade from $v: risk-register.toml mode 640" test "$(mode_of "$ETC/risk-register.toml")" = 640
+  check "upgrade from $v: scan.conf mode 640" test "$(mode_of "$ETC/scan.conf")" = 640
+  check "upgrade from $v: says it made gitleaks.toml private" out_has "make $ETC/gitleaks.toml private (mode 0644 to 0600)"
   run "$NEW" --uninstall
   check "uninstall after upgrade from $v removes every unit" bash -c "! ls ${UNITS[*]} 2>/dev/null | grep -q ."
   check "uninstall after upgrade from $v removes /opt/security-scan" absent "$OPT"
@@ -500,9 +605,9 @@ echo "# edited by hand" >"$ETC/aide.conf"
 chmod 0666 "$ETC/aide.conf"
 run "$NEW"
 check "an open aide.conf is backed up" bash -c "ls '$ETC'/aide.conf.bak-* >/dev/null 2>&1"
-check "the aide.conf backup is at most 0644" \
-  bash -c "for f in '$ETC'/aide.conf.bak-*; do [ \$((8#\$(stat -c %a \"\$f\") & 8#133)) -eq 0 ] || exit 1; done"
-check "the new aide.conf is at most 0644" test "$(mode_of "$ETC/aide.conf")" = 644
+check "the aide.conf backup is at most 0600" \
+  bash -c "for f in '$ETC'/aide.conf.bak-*; do [ \$((8#\$(stat -c %a \"\$f\") & 8#177)) -eq 0 ] || exit 1; done"
+check "the new aide.conf is at most 0600" test "$(mode_of "$ETC/aide.conf")" = 600
 
 # ------------------------------------------------------------ dry run
 reset

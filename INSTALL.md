@@ -207,14 +207,25 @@ gitleaks finding as a possible secret in red. That is expected: see [Writing a r
 
 ## Configuration
 
-Everything lives in `/etc/security-scan`, owned by root.
+Everything lives in `/etc/security-scan`, owned by root. These files hold
+private names and paths, so no other local user can read them. The report
+runs as the desktop user, so the two it reads are shared with that user's own
+group; the rest are root's alone.
 
-| File | Installed | Holds |
-|---|---|---|
-| `scan.conf` | once, never overwritten | the desktop user, the folder of repositories for gitleaks, the folders of model files, links to accept from install scripts |
-| `aide.conf` | generated on every install | what AIDE watches and ignores |
-| `gitleaks.toml` | once, never overwritten | extra gitleaks rules and allowlists |
-| `risk-register.toml` | once, never overwritten | your assessment of each known finding |
+| File | Installed | Readable by | Holds |
+|---|---|---|---|
+| `scan.conf` | once, never overwritten | root and your group (0640) | the desktop user, the folder of repositories for gitleaks, the folders of model files, links to accept from install scripts |
+| `aide.conf` | generated on every install | root (0600) | what AIDE watches and ignores |
+| `gitleaks.toml` | once, never overwritten | root (0600) | extra gitleaks rules and allowlists |
+| `risk-register.toml` | once, never overwritten | root and your group (0640) | your assessment of each known finding |
+
+"Your group" is the group with your user name, when it is your primary group
+and has no other members. If there is no such group, `scan.conf` and the risk
+register stay readable by everyone, and the installer says so. Installing
+over a version before 0.2.10 tightens existing files once and prints
+`make ... private` for each; it never loosens a mode, and leaves a symlink or
+a file root does not own as it is, with a note. Use `sudo` to read
+`gitleaks.toml` and `aide.conf`.
 
 `/etc/rkhunter.conf.local` is also installed once and never overwritten. It
 holds rkhunter exceptions for files that are known to be harmless on a stock

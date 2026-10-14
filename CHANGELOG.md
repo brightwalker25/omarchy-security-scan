@@ -6,6 +6,60 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-10-14
+
+A review of 0.2.9 looked for every other place where private names or paths
+could reach other local users, through the process list or a readable file.
+
+### Security
+
+- AIDE findings in the home folder, such as a changed file in `~/.ssh` or
+  `~/.local/bin`, were passed to `pacman`, `readlink` and `python3` as
+  arguments, so a private file name was visible in the process list. Paths in
+  the home folder are now handled only inside the shell. No package owns
+  them, so the verdicts and their wording are unchanged, except that a link
+  in the home folder can no longer be explained by a package's install
+  script or a `SCRIPTLET_LINKS` entry. A system link that points into the
+  home folder is handled the same way, and so is a home folder file in
+  rkhunter's results.
+- The model scan started `picklescan` and `find` with each model folder's
+  path as an argument, visible for the whole scan. Both now run from inside
+  the folder. A folder that cannot be entered is reported as not scanned.
+- `security-report` passed file paths to `pacman -Qqo` as arguments. It now
+  passes them on standard input.
+- The files in `/etc/security-scan` were readable by every local user,
+  though they hold the desktop user's name and home folder, the folders
+  scanned, gitleaks rules written to find a private name, and the paths of
+  repositories with findings. `gitleaks.toml` and `aide.conf`, read only by
+  the scans, are now 0600. `scan.conf` and `risk-register.toml`, which the
+  report reads as the desktop user, are 0640 and shared with that user's own
+  group. Installing over an earlier version tightens existing files once and
+  prints `make ... private` for each. It only ever removes permissions, and
+  leaves a symlink, a file root does not own or anything that is not a
+  regular file as it is, with a note. If the user has no group of their own,
+  those two files stay readable by everyone and the installer says so. AIDE
+  watches `/etc`, so the first scan after upgrading reports these mode
+  changes once, in amber.
+- The HTML report and the folder that holds it were written with the user's
+  umask, usually readable by everyone, though they name repositories, rules
+  and changed files. Pages are now 0600 and `~/.local/share/security-report`
+  is 0700, and pages already there are made private. A page is written to a
+  new file and renamed into place, so a symlink at its path is replaced, not
+  written through.
+
+### Fixed
+
+- gitleaks exits 1 both when it finds a secret and when it fails, for
+  example on a missing config, so a failed run read as clean. Secrets now
+  give exit 3, and any other non-zero exit is logged as an error, which the
+  report shows. A missing or unreadable `gitleaks.toml` is logged as well.
+- The report dropped a repository whose path holds a space, so its findings
+  were missing and the section could show green. Such paths are now read in
+  full. If the scan counted more findings than the report could match to a
+  repository, the section shows the difference in red.
+- A failed write of the HTML report prints a message and exits 2, rather
+  than a traceback.
+
 ## [0.2.9] - 2026-10-14
 
 ### Security

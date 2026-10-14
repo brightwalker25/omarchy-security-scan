@@ -95,11 +95,14 @@ say() { printf '==> %s\n' "$*"; }
 # name starts with a dot and ends in random letters, so systemd never loads
 # it as a unit. A file that already has this content and mode is left as it
 # is, so that re-running the installer does not show up in AIDE as a change.
+# The group is root unless a third argument names another, which is then
+# checked too.
 put() {
-  local dest="$1" mode="$2" dir tmp
+  local dest="$1" mode="$2" group="${3:-root}" dir tmp want have shown=""
   dir=$(dirname "$dest")
+  if [ "$group" != root ]; then shown=", group ${group}"; fi
   if [ "$DRY" -eq 1 ]; then
-    printf '  write %s (mode %s)\n' "$dest" "$mode"
+    printf '  write %s (mode %s%s)\n' "$dest" "$mode" "$shown"
     cat >/dev/null
     return 0
   fi
@@ -114,15 +117,20 @@ put() {
     echo "could not write ${dest}" >&2
     exit 1
   fi
-  if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$tmp" "$dest" &&
-    [ "$(stat -c '%a:%u' -- "$dest")" = "${mode#0}:${ROOT_UID}" ]; then
+  want="${mode#0}:${ROOT_UID}"
+  have=$(stat -c '%a:%u' -- "$dest" 2>/dev/null || true)
+  if [ "$group" != root ]; then
+    want="${want}:$(getent group "$group" | cut -d: -f3)"
+    have=$(stat -c '%a:%u:%g' -- "$dest" 2>/dev/null || true)
+  fi
+  if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s "$tmp" "$dest" && [ "$have" = "$want" ]; then
     rm -f "$tmp"
     PUT_TMP=""
     printf '  keep %s (up to date)\n' "$dest"
     return 0
   fi
-  printf '  write %s (mode %s)\n' "$dest" "$mode"
-  if ! chown root:root "$tmp" || ! chmod "$mode" "$tmp" || ! mv -fT "$tmp" "$dest"; then
+  printf '  write %s (mode %s%s)\n' "$dest" "$mode" "$shown"
+  if ! chown "root:${group}" "$tmp" || ! chmod "$mode" "$tmp" || ! mv -fT "$tmp" "$dest"; then
     rm -f "$tmp"
     echo "could not write ${dest}" >&2
     exit 1
@@ -333,6 +341,27 @@ case "${TARGET_USER}${TARGET_HOME}" in
     exit 1
     ;;
 esac
+
+TARGET_GID=$(printf '%s' "$entry" | cut -d: -f4)
+
+# The report runs as the desktop user and reads the risk register and
+# scan.conf, so those two are shared with one group only: the desktop user's
+# own, which has the user's name, is their primary group, and has no other
+# member, the same group the scan logs are shared with. If there is no such
+# group, as when every account is in "users", a group read would reach other
+# people too, so both stay readable by everyone, as before 0.2.10, and the
+# installer says so.
+USER_GROUP=""
+if grp_entry=$(getent group "$TARGET_USER") &&
+  [ "$(printf '%s' "$grp_entry" | cut -d: -f3)" = "$TARGET_GID" ]; then
+  case ",$(printf '%s' "$grp_entry" | cut -d: -f4)," in
+    ,, | ",${TARGET_USER},")
+      if [ -z "$(getent passwd | awk -F: -v g="$TARGET_GID" -v u="$TARGET_USER" '$4 == g && $1 != u')" ]; then
+        USER_GROUP=$TARGET_USER
+      fi
+      ;;
+  esac
+fi
 
 BUS="${RUN_USER}/${TARGET_UID}/bus"
 as_user() {
@@ -586,26 +615,73 @@ fi
 regex_escape() { printf '%s' "$1" | sed 's/[][\\.*^$+?(){}|]/\\&/g'; }
 HOME_RE=$(regex_escape "$TARGET_HOME")
 
+# The configuration holds private names and paths: scan.conf the desktop
+# user's name, home folder and the folders scanned, aide.conf the home
+# folder, gitleaks.toml the rules a user writes to find their own name, and
+# the risk register the paths of repositories and what was found in them. So
+# none of it is readable by other local users. gitleaks.toml and aide.conf
+# are read only by the scans, which run as root, and are root's alone (0600).
+# The report runs as the desktop user and reads the risk register and
+# scan.conf, so those two are shared with the desktop user's own group (0640).
+REPORT_MODE=0640
+REPORT_GROUP=$USER_GROUP
+if [ -z "$USER_GROUP" ]; then
+  REPORT_MODE=0644
+  REPORT_GROUP=root
+  NOTES+=("${TARGET_USER} has no group of their own, so ${ETC}/scan.conf and ${ETC}/risk-register.toml stay readable by every local user, or the weekly report could not read them. They hold your user name, home folder and repository paths.")
+fi
+
+# Versions before 0.2.10 installed every file here readable by everyone.
+# tighten takes away what a file no longer needs, once: its mode becomes the
+# old one masked by MASK, so permissions are only ever removed, and a file an
+# administrator made more private keeps that. A file still in root's group
+# whose new mode lets the group read it moves to GROUP, which is the one
+# reader it gains: the desktop user, who reads it through the report. Only a
+# regular, root-owned file that is not a symlink is changed. The preflight
+# has checked that only root can write in this folder, so nothing can swap
+# the file between the check and the change. Anything else is left as it is
+# and listed at the end.
+tighten() {
+  local path="$1" mask="$2" group="${3:-root}" cur new
+  present "$path" || return 0
+  if [ -L "$path" ] || [ ! -f "$path" ] || ! root_owned "$path"; then
+    echo "  left ${path} as it is ($(why_not_ours "$path" file))"
+    NOTES+=("${path} was left as it is, because it is $(why_not_ours "$path" file). It may hold private names and paths; check that other users cannot read it.")
+    return 0
+  fi
+  cur=$(stat -c %a -- "$path")
+  new=$(printf '0%o' $((8#$cur & 8#$mask)))
+  if [ $((8#$cur)) -ne $((8#$new)) ]; then
+    echo "  make ${path} private (mode 0${cur#0} to ${new})"
+    run chmod "$new" "$path"
+  fi
+  if [ "$group" != root ] && [ $((8#$new & 8#040)) -ne 0 ] &&
+    [ "$(stat -c %g -- "$path")" = 0 ]; then
+    run chown "root:${group}" "$path"
+  fi
+}
+
 if present "$ETC/scan.conf"; then
   echo "  keep ${ETC}/scan.conf (exists)"
+  tighten "$ETC/scan.conf" "$REPORT_MODE" "$REPORT_GROUP"
 else
   conf=$(<"$SRC/system/scan.conf.example")
   conf=${conf//@USER@/"$TARGET_USER"}
   conf=${conf//@HOME@/"$TARGET_HOME"}
-  put "$ETC/scan.conf" 0644 <<<"$conf"
+  put "$ETC/scan.conf" "$REPORT_MODE" "$REPORT_GROUP" <<<"$conf"
 fi
 
 # aide.conf is generated from the template, so it is replaced on every run.
 # A copy that differs is kept in case it was edited by hand, under a name
 # that is not yet taken, so no earlier backup is overwritten. The backup keeps
-# the mode of the file it copies, at most 0644, and the new file is never more
+# the mode of the file it copies, at most 0600, and the new file is never more
 # open than the one it replaces, so a file that was made private stays private.
 aide_conf=$(<"$SRC/system/aide.conf.in")
 aide_conf=${aide_conf//@HOME@/"$HOME_RE"}
-aide_mode=0644
+aide_mode=0600
 if [ -f "$ETC/aide.conf" ] && [ ! -L "$ETC/aide.conf" ]; then
   old_mode=$(stat -c %a -- "$ETC/aide.conf")
-  aide_mode=$(printf '0%o' $((8#$old_mode & 8#644)))
+  aide_mode=$(printf '0%o' $((8#$old_mode & 8#600)))
   if ! printf '%s\n' "$aide_conf" | cmp -s - "$ETC/aide.conf"; then
     bak="$ETC/aide.conf.bak-${DATE}"
     n=1
@@ -619,21 +695,29 @@ fi
 # A here-string, not a pipe: put must run in this shell, where the trap that
 # removes an interrupted temporary file can see it.
 put "$ETC/aide.conf" "$aide_mode" <<<"$aide_conf"
+# Backups made by earlier versions kept the mode of the file they copied.
+for f in "$ETC"/aide.conf.bak-*; do
+  tighten "$f" 0600
+done
 
 # These hold the user's own rules and assessments. Never overwrite them. A
 # symlink counts as existing even when it points nowhere, so nothing is ever
 # created through one.
 install_once() {
-  local src="$1" dest="$2" mode="$3"
+  local src="$1" dest="$2" mode="$3" group="${4:-root}"
   if present "$dest"; then
     echo "  keep ${dest} (exists)"
   else
-    put "$dest" "$mode" <"$src"
+    put "$dest" "$mode" "$group" <"$src"
   fi
 }
-install_once "$SRC/system/gitleaks.example.toml" "$ETC/gitleaks.toml" 0644
-install_once "$SRC/system/risk-register.example.toml" "$ETC/risk-register.toml" 0644
+install_once "$SRC/system/gitleaks.example.toml" "$ETC/gitleaks.toml" 0600
+install_once "$SRC/system/risk-register.example.toml" "$ETC/risk-register.toml" "$REPORT_MODE" "$REPORT_GROUP"
 install_once "$SRC/system/rkhunter.conf.local.example" "$RKH_LOCAL" 0640
+# Only the files in this plugin's own folder are tightened. rkhunter.conf.local
+# may be the administrator's, and every version installed it 0640.
+tighten "$ETC/gitleaks.toml" 0600
+tighten "$ETC/risk-register.toml" "$REPORT_MODE" "$REPORT_GROUP"
 
 # ---------------------------------------------------------------------------
 # Units

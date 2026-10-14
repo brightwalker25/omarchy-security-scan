@@ -314,7 +314,8 @@ omarchy-shell brightwalker25.security-scan refresh
 
 On Monday at 13:00, after the Monday scans, a user timer writes the report as a
 self-contained HTML page in `~/.local/share/security-report/`, named by date so
-that past weeks stay comparable, and points `latest.html` at it. It then sends
+that past weeks stay comparable, and points `latest.html` at it. The folder
+and its pages are readable by you alone. It then sends
 a desktop notification with the overall rating and the summary line. The
 notification is marked critical when the report is red, and has an Open action
 that shows the page. If the laptop is off at 13:00, the report runs at the next
