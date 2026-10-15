@@ -6,6 +6,43 @@ Notable changes to the Security Scan plugin and its scan suite. Versions follow
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-10-15
+
+### Security
+
+- When the desktop user had no group of their own, 0.2.10 left `scan.conf`
+  and `risk-register.toml` readable by every local user, so that the report
+  could still read them. They hold the user's name, home folder and
+  repository paths. The installer now refuses to install in that case,
+  before it changes anything, and says how to give the user a private
+  primary group. Uninstalling works as before. If an earlier version left
+  files in `/etc/security-scan`, the refusal says so and suggests
+  `chmod o-rwx` on them until the group exists.
+- The test for a group of the user's own is stricter. The group must have
+  the user's name and be their primary group, both found in the local
+  files; it must be the only group with its GID, with no other member in
+  `/etc/group` or `/etc/gshadow`; and no other account may have it as its
+  primary group. A primary group shared by several accounts, such as
+  `users`, does not count. Only the local files list every account, so a
+  machine whose `/etc/nsswitch.conf` also looks up accounts or groups
+  elsewhere, such as in LDAP or SSSD, does not qualify either. 0.2.10 did
+  not look at `/etc/gshadow`, at other groups with the same GID, or at where
+  accounts and groups were looked up.
+- A file in `/etc/security-scan` that an administrator had given to another
+  group, such as `users`, kept that group, so all of its members could
+  still read it after 0.2.10 tightened its mode. Installing now moves
+  `scan.conf` and `risk-register.toml` to the desktop user's own group and
+  prints `take ... from group` for each. Files only root reads already lost
+  their group permissions.
+- Each scan shared its log folder in `/var/log/security-scan` (0750) and
+  its copy of the lynis report (0640) with the group named after the
+  desktop user, even when that group was no longer private, for example
+  because another account had been added to it after installing. The logs
+  name repositories, files and findings. Each scan run as root now makes
+  the same test as the installer and, without a private group, keeps the
+  folder 0700 for root alone, writes the lynis copy 0600, and says so on
+  stderr. An existing folder is closed on the next run.
+
 ## [0.2.10] - 2026-10-14
 
 A review of 0.2.9 looked for every other place where private names or paths

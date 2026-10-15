@@ -3,7 +3,8 @@
 # Sandbox harness for bin/security-scan-install. Runs the installer as an
 # ordinary user against a temporary directory tree, with pacman, systemctl,
 # runuser, rkhunter, uv and chown stubbed, and checks what it writes, refuses
-# and removes. Nothing outside the temporary tree is changed, and root is
+# and removes. getent is real, except in the checks for an account without a
+# group of its own, which put a stub reading made-up files first on PATH. Nothing outside the temporary tree is changed, and root is
 # never needed.
 #
 #   bash tests/sandbox-install.sh
@@ -21,7 +22,7 @@ SB="$WORK/sb"
 STUB="$WORK/stub"
 # Every release of this plugin whose installer is in the git history.
 RELEASES=(v021:fc8cc3d v022:79c0c2e v023:de1c328 v024:0f64334 v025:c467467 v026:3f1f7d3 v027:bdf26c8
-  v028:534b5dd v029:16d6f9c)
+  v028:534b5dd v029:16d6f9c v0210:e2953f7)
 
 pass=0 fail=0
 ok() { pass=$((pass + 1)); printf 'ok    %s\n' "$1"; }
@@ -99,6 +100,8 @@ sandboxify() {
     -e "s|/var/lib/|$SB/var/lib/|g" \
     -e "s|/run/user|$SB/run/user|g" \
     -e "s|^ROOT_UID=0\$|ROOT_UID=\${ROOT_UID_OVERRIDE:-$(id -u)}|" \
+    -e "s|^NSSWITCH=/etc/nsswitch.conf\$|NSSWITCH=\${NSSWITCH_OVERRIDE:-/etc/nsswitch.conf}|" \
+    -e "s|^GSHADOW=/etc/gshadow\$|GSHADOW=\${GSHADOW_OVERRIDE:-$WORK/gshadow-absent}|" \
     -e 's|install -D -o root -g root |install -D |g' \
     -e 's|install -d -o root -g root |install -d |g' \
     -e 's|^if \[ "\$(id -u)" -ne 0 \]; then$|if false; then|' \
@@ -129,7 +132,7 @@ reset() {
 run() { # installer, args...
   local s=$1
   shift
-  PATH="$STUB:$PATH" SUDO_USER=$(id -un) bash "$s" "$@" >"$WORK/out" 2>"$WORK/err"
+  PATH="${GETENT_STUB:+$GETENT_STUB:}$STUB:$PATH" SUDO_USER=$(id -un) bash "$s" "$@" >"$WORK/out" 2>"$WORK/err"
 }
 
 sum() { sha256sum "$1" | cut -d' ' -f1; }
@@ -455,9 +458,155 @@ if ns true 2>/dev/null; then
   check "root's scan.conf in root's group: given to the desktop user's group" \
     called "chown root:$ME $ETC/scan.conf"
   ns rm -f "$ETC/gitleaks.toml"
+
+  # A file an administrator gave to another group, such as "users", would
+  # stay readable by all of its members. The report's two files move to the
+  # desktop user's group; gitleaks.toml, read only by root, loses its group
+  # bits, after which its group no longer matters. chown is stubbed, so the
+  # move shows in its call log.
+  reset
+  mkdir -p "$ETC"
+  for f in risk-register.toml scan.conf; do
+    echo "old $f" >"$ETC/$f"
+    chmod 644 "$ETC/$f"
+  done
+  echo "old gitleaks.toml" >"$ETC/gitleaks.toml"
+  chmod 640 "$ETC/gitleaks.toml"
+  ns chown 0:100 "$ETC/risk-register.toml" "$ETC/scan.conf" "$ETC/gitleaks.toml"
+  ns env PATH="$STUB:$PATH" SUDO_USER="$ME" ROOT_UID_OVERRIDE=0 \
+    bash "$NEW" >"$WORK/out" 2>"$WORK/err"
+  rc=$?
+  check "files in another group: install succeeds" test $rc -eq 0
+  for f in risk-register.toml scan.conf; do
+    check "$f 0644 in another group: mode 640" test "$(mode_of "$ETC/$f")" = 640
+    check "$f 0644 in another group: moved to the desktop user's group" called "chown root:$ME $ETC/$f"
+    check "$f 0644 in another group: the move is shown" out_has "take $ETC/$f from group"
+  done
+  check "gitleaks.toml 0640 in another group: mode 600" test "$(mode_of "$ETC/gitleaks.toml")" = 600
+  check "gitleaks.toml 0640 in another group: content kept" grep -qx 'old gitleaks.toml' "$ETC/gitleaks.toml"
+  ns rm -f "$ETC/gitleaks.toml" "$ETC/risk-register.toml" "$ETC/scan.conf"
 else
   echo "skip  ownership checks: no user namespace with a second id"
 fi
+
+# ------------------------------------------------------------ no group of the user's own
+# scan.conf and the risk register are shared with the desktop user's own
+# group only. Without one, the installer refuses before changing anything,
+# rather than leave them readable by every local user as 0.2.10 did. A getent
+# stub answers from made-up passwd and group files, and made-up nsswitch.conf
+# and gshadow files stand in for the real ones, so each kind of account can
+# be tried without changing the machine.
+GETENT_DIR="$WORK/getent"
+mkdir -p "$GETENT_DIR"
+cat >"$GETENT_DIR/getent" <<'EOF'
+#!/bin/sh
+# -s files and every other source read the same made-up files.
+[ "$1" = -s ] && shift 2
+case "$1" in
+  passwd) f=$FAKE_PASSWD ;;
+  group) f=$FAKE_GROUP ;;
+  *) exec /usr/bin/getent "$@" ;;
+esac
+[ $# -eq 1 ] && exec cat "$f"
+awk -F: -v k="$2" '$1 == k || $3 == k { print; found = 1; exit } END { exit found ? 0 : 2 }' "$f"
+EOF
+chmod +x "$GETENT_DIR/getent"
+ME_ENTRY=$(getent passwd "$ME")
+ME_GID=$(printf '%s' "$ME_ENTRY" | cut -d: -f4)
+OTHER="other-account"
+accounts() { # scenario -> made-up passwd and group files
+  printf 'root:x:0:0::/root:/bin/sh\n%s\n' "$ME_ENTRY" >"$WORK/passwd"
+  printf 'root:x:0:\n' >"$WORK/group"
+  printf 'passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\n' >"$WORK/nsswitch.conf"
+  printf 'root:!*::\n%s:!*::\n' "$ME" >"$WORK/gshadow"
+  case "$1" in
+    private) echo "$ME:x:$ME_GID:" >>"$WORK/group" ;;
+    no-group) echo "users:x:$ME_GID:" >>"$WORK/group" ;;
+    not-primary) printf 'users:x:%s:\n%s:x:%s:\n' "$ME_GID" "$ME" "$((ME_GID + 50000))" >>"$WORK/group" ;;
+    other-member) echo "$ME:x:$ME_GID:$ME,$OTHER" >>"$WORK/group" ;;
+    shared-primary)
+      echo "$ME:x:$ME_GID:" >>"$WORK/group"
+      echo "$OTHER:x:60001:$ME_GID::/nonexistent:/bin/sh" >>"$WORK/passwd"
+      ;;
+    same-gid) printf '%s:x:%s:\nstaff:x:%s:%s\n' "$ME" "$ME_GID" "$ME_GID" "$OTHER" >>"$WORK/group" ;;
+    gshadow-member)
+      echo "$ME:x:$ME_GID:" >>"$WORK/group"
+      printf 'root:!*::\n%s:!*::%s\n' "$ME" "$OTHER" >"$WORK/gshadow"
+      ;;
+    nss-ldap)
+      echo "$ME:x:$ME_GID:" >>"$WORK/group"
+      printf 'passwd: files ldap\ngroup: files ldap\n' >"$WORK/nsswitch.conf"
+      ;;
+    nss-sss)
+      echo "$ME:x:$ME_GID:" >>"$WORK/group"
+      printf 'passwd: files systemd sss\ngroup: files [SUCCESS=merge] systemd sss\n' >"$WORK/nsswitch.conf"
+      ;;
+  esac
+}
+as_accounts() { # scenario, installer, args...
+  local a=$1
+  shift
+  accounts "$a"
+  GETENT_STUB=$GETENT_DIR FAKE_PASSWD="$WORK/passwd" FAKE_GROUP="$WORK/group" \
+    NSSWITCH_OVERRIDE="$WORK/nsswitch.conf" GSHADOW_OVERRIDE="$WORK/gshadow" run "$@"
+}
+
+# The stub itself must not cause a refusal: with a private group it installs.
+reset
+as_accounts private "$NEW"
+check "getent stub with a private group: install succeeds" test $? -eq 0
+check "getent stub with a private group: files shared with that group" \
+  called "chown root:$ME $ETC/.scan.conf."
+
+for a in no-group not-primary other-member shared-primary same-gid gshadow-member nss-ldap nss-sss; do
+  # A fresh machine: nothing in /etc/security-scan yet.
+  reset
+  before=$(snapshot)
+  as_accounts "$a" "$NEW"
+  rc=$?
+  check "$a, fresh: install refuses" test $rc -ne 0
+  check "$a, fresh: reason on stderr" err_has "$ME has no group of their own"
+  check "$a, fresh: nothing written or changed" test "$before" = "$(snapshot)"
+  check "$a, fresh: no package or unit command run" test ! -s "$SB/calls.log"
+
+  # An install that 0.2.10 made for such an account, with scan.conf and the
+  # risk register left readable by everyone.
+  reset
+  as_accounts "$a" "$(old v0210)"
+  # 0.2.10 saw no group of the user's own in the first four cases, and took
+  # the group for private in the others.
+  case "$a" in
+    no-group | not-primary | other-member | shared-primary) m=644 ;;
+    *) m=640 ;;
+  esac
+  check "$a, over 0.2.10: 0.2.10 left scan.conf at $m" test "$(mode_of "$ETC/scan.conf")" = $m
+  : >"$SB/calls.log"
+  before=$(snapshot)
+  as_accounts "$a" "$NEW"
+  rc=$?
+  check "$a, over 0.2.10: install refuses" test $rc -ne 0
+  check "$a, over 0.2.10: reason on stderr" err_has "$ME has no group of their own"
+  check "$a, over 0.2.10: stderr says to make the old files private" err_has "chmod o-rwx $ETC/*"
+  check "$a, over 0.2.10: every file, mode and time unchanged" test "$before" = "$(snapshot)"
+  check "$a, over 0.2.10: no package or unit command run" test ! -s "$SB/calls.log"
+done
+
+# Uninstalling needs no group of the user's own, so it still works.
+reset
+run "$NEW"
+: >"$SB/calls.log"
+as_accounts no-group "$NEW" --uninstall
+rc=$?
+check "no-group: uninstall succeeds" test $rc -eq 0
+check "no-group: uninstall removes every unit" bash -c "! ls ${UNITS[*]} 2>/dev/null | grep -q ."
+check "no-group: uninstall removes /opt/security-scan" absent "$OPT"
+check "no-group: uninstall disables the report timer" called "systemctl --global disable security-report.timer"
+check "no-group: uninstall warns about nothing" test ! -s "$WORK/err"
+reset
+as_accounts shared-primary "$(old v0210)"
+as_accounts shared-primary "$NEW" --uninstall
+check "shared-primary: uninstall of a 0.2.10 install succeeds" test $? -eq 0
+check "shared-primary: uninstall of a 0.2.10 install removes every unit" bash -c "! ls ${UNITS[*]} 2>/dev/null | grep -q ."
 
 # ------------------------------------------------------------ upgrades
 for r in "${RELEASES[@]}"; do
@@ -480,7 +629,9 @@ for r in "${RELEASES[@]}"; do
   check "upgrade from $v: aide.conf made private, mode 600" test "$(mode_of "$ETC/aide.conf")" = 600
   check "upgrade from $v: risk-register.toml mode 640" test "$(mode_of "$ETC/risk-register.toml")" = 640
   check "upgrade from $v: scan.conf mode 640" test "$(mode_of "$ETC/scan.conf")" = 640
-  check "upgrade from $v: says it made gitleaks.toml private" out_has "make $ETC/gitleaks.toml private (mode 0644 to 0600)"
+  if [ "$v" != v0210 ]; then
+    check "upgrade from $v: says it made gitleaks.toml private" out_has "make $ETC/gitleaks.toml private (mode 0644 to 0600)"
+  fi
   run "$NEW" --uninstall
   check "uninstall after upgrade from $v removes every unit" bash -c "! ls ${UNITS[*]} 2>/dev/null | grep -q ."
   check "uninstall after upgrade from $v removes /opt/security-scan" absent "$OPT"

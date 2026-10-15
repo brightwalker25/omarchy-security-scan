@@ -75,12 +75,59 @@ if [ -z "$DESKTOP_USER" ] || [ -z "$user_home" ]; then
   exit 1
 fi
 
+# The logs name repositories, files and findings, and the report reads them
+# as the desktop user, so they are shared with the desktop user's own group
+# and no one else. The installer refuses a machine without such a group, but
+# groups can change after it ran, so the same test is made on every run: a
+# group with the user's name that is their primary group and the only group
+# with its GID, with no other member in /etc/group or /etc/gshadow, that no
+# other account has as its primary group, on a machine that looks up
+# accounts and groups only in the local files and systemd. Without one, the
+# logs stay root's alone and the report cannot read them.
+NSSWITCH=/etc/nsswitch.conf
+GSHADOW=/etc/gshadow
+only_member() {
+  case ",$1," in ,, | ",${DESKTOP_USER},") return 0 ;; esac
+  return 1
+}
+private_group() {
+  local gid grp line src srcs gs
+  # read -a splits on blanks without expanding [NOTFOUND=return] as a glob.
+  while read -r line; do
+    read -ra srcs <<<"$line"
+    for src in "${srcs[@]}"; do
+      case "$src" in
+        files | systemd | \[*\]) ;;
+        *) return 1 ;;
+      esac
+    done
+  done < <(awk -F: '$1 ~ /^[ \t]*(passwd|group)[ \t]*$/ { sub(/#.*/, "", $2); print $2 }' "$NSSWITCH" 2>/dev/null)
+  gid=$(getent passwd "$DESKTOP_USER" | cut -d: -f4)
+  grp=$(getent group "$DESKTOP_USER") || return 1
+  [ -n "$gid" ] && [ "$(printf '%s' "$grp" | cut -d: -f3)" = "$gid" ] || return 1
+  only_member "$(printf '%s' "$grp" | cut -d: -f4)" || return 1
+  [ "$(getent group | awk -F: -v g="$gid" '$3 == g' | wc -l)" -eq 1 ] || return 1
+  [ -z "$(getent passwd | awk -F: -v g="$gid" -v u="$DESKTOP_USER" '$4 == g && $1 != u')" ] || return 1
+  [ -e "$GSHADOW" ] || return 0
+  gs=$(awk -F: -v n="$DESKTOP_USER" '$1 == n { print $4 }' "$GSHADOW") || return 1
+  only_member "$gs"
+}
+
+LOG_GROUP=""
 if [ "$(id -u)" -eq 0 ]; then
-  install -d -m 0750 -o root -g "$DESKTOP_USER" "$LOG_DIR"
+  if private_group; then
+    LOG_GROUP=$DESKTOP_USER
+    install -d -m 0750 -o root -g "$LOG_GROUP" "$LOG_DIR"
+  else
+    install -d -m 0700 -o root -g root "$LOG_DIR"
+  fi
 else
   install -d -m 0750 "$LOG_DIR"
 fi
 LOG="$LOG_DIR/${MODE}-$(date +%Y%m%d-%H%M%S).log"
+if [ "$(id -u)" -eq 0 ] && [ -z "$LOG_GROUP" ]; then
+  echo "${0##*/}: ${DESKTOP_USER} has no group of their own, so ${LOG_DIR} is kept for root alone and the report cannot read it" >&2
+fi
 
 log() { printf '%s\n' "$*" >>"$LOG"; }
 
@@ -239,8 +286,10 @@ lynis)
   if [ -r "$report" ]; then
     # lynis writes its report 0640 root:root; re-lay it down so the desktop
     # user can read its own audit without sudo.
-    if [ "$(id -u)" -eq 0 ]; then
-      install -m 0640 -g "$DESKTOP_USER" "$report" "${LOG%.log}-report.dat"
+    if [ -n "$LOG_GROUP" ]; then
+      install -m 0640 -g "$LOG_GROUP" "$report" "${LOG%.log}-report.dat"
+    elif [ "$(id -u)" -eq 0 ]; then
+      install -m 0600 -g root "$report" "${LOG%.log}-report.dat"
     else
       cp -f "$report" "${LOG%.log}-report.dat"
     fi

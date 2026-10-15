@@ -18,6 +18,7 @@ For what each scan catches and how the report grades it, see the
 | `uv` | installing `picklescan`, which is not packaged for Arch |
 | an AUR helper such as `yay` | installing AIDE, which is only in the AUR |
 | Omarchy shell with plugin support | the bar widget and panel |
+| a primary group of your own, named after your account, in the local account files | sharing `scan.conf` and the risk register with the weekly report and no one else; see [Configuration](#configuration) |
 
 The installer adds `arch-audit`, `lynis`, `gitleaks`, `rkhunter` and `python`
 from the official repositories itself. It does not install `uv` or AIDE.
@@ -220,12 +221,29 @@ group; the rest are root's alone.
 | `risk-register.toml` | once, never overwritten | root and your group (0640) | your assessment of each known finding |
 
 "Your group" is the group with your user name, when it is your primary group
-and has no other members. If there is no such group, `scan.conf` and the risk
-register stay readable by everyone, and the installer says so. Installing
-over a version before 0.2.10 tightens existing files once and prints
+in `/etc/passwd` and `/etc/group`, is the only group with its GID, has no other
+members in `/etc/group` or `/etc/gshadow`, and is no other account's primary
+group. Only the local files list every account, so the `passwd` and `group`
+lines in `/etc/nsswitch.conf` may name only `files` and `systemd`, not a
+directory such as LDAP or SSSD. If there is no such group, for example when
+every account has `users` as its primary group, the installer refuses to
+install and changes nothing, because sharing `scan.conf` and the risk register
+with the report would let other local users read them too. Give your account a
+private primary group and log in again before installing:
+
+```bash
+sudo groupadd "$USER" && sudo usermod -g "$USER" "$USER"
+```
+
+If a group with your user name already exists, `groupadd` fails. Then make
+that group your primary group with `usermod -g` instead, once it has no other
+members and no other account has it as its primary group. Installing over a
+version before 0.2.10 tightens existing files once and prints
 `make ... private` for each; it never loosens a mode, and leaves a symlink or
-a file root does not own as it is, with a note. Use `sudo` to read
-`gitleaks.toml` and `aide.conf`.
+a file root does not own as it is, with a note. If the report reads a file
+that was given to another group, such as `users`, it moves to your group, with
+`take ... from group`; a file only root reads loses its group permissions.
+Use `sudo` to read `gitleaks.toml` and `aide.conf`.
 
 `/etc/rkhunter.conf.local` is also installed once and never overwritten. It
 holds rkhunter exceptions for files that are known to be harmless on a stock
@@ -378,8 +396,15 @@ sudo systemctl start security-scan@aide.service
 The instances are `arch-audit`, `aide`, `models`, `gitleaks`, `rkhunter` and
 `lynis`. The command returns when the scan finishes. Each run writes a log in
 `/var/log/security-scan`, named by scan and time, and the last 12 logs of each
-scan are kept. The folder is readable by the desktop user, so reading the logs
-and running the report need no `sudo`.
+scan are kept. The folder belongs to root and your group (0750), and the copy
+of the lynis report in it is 0640, so reading the logs and running the report
+need no `sudo`. "Your group" means the same here as in
+[Configuration](#configuration), and each scan checks it again when it runs,
+because groups can change after installing. If the group is no longer yours
+alone, for example because another account was added to it, the scan makes
+the folder root's alone (0700), writes the lynis copy 0600, and says so in
+the journal. The report then cannot read the logs until the group is private
+again.
 
 To point one run somewhere else without editing `scan.conf`, run the script
 directly with the variable set:

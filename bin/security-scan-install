@@ -346,21 +346,48 @@ TARGET_GID=$(printf '%s' "$entry" | cut -d: -f4)
 
 # The report runs as the desktop user and reads the risk register and
 # scan.conf, so those two are shared with one group only: the desktop user's
-# own, which has the user's name, is their primary group, and has no other
-# member, the same group the scan logs are shared with. If there is no such
-# group, as when every account is in "users", a group read would reach other
-# people too, so both stay readable by everyone, as before 0.2.10, and the
-# installer says so.
+# own, the same group the scan logs are shared with. It must have the user's
+# name and be their primary group; it must be the only group with its GID,
+# with no other member in /etc/group or /etc/gshadow; and no other account
+# may have it as its primary group. That last check can only see every
+# account when accounts come from the local files and systemd alone, so a
+# machine that also looks up accounts or groups in a directory such as LDAP
+# does not qualify. Root can always read /etc/gshadow; when it cannot be
+# read, which happens only in a dry run without root, it is not checked. If there is no such group, as when
+# every account is in "users", a group read would reach other people too, so
+# the preflight refuses to install.
+NSSWITCH=/etc/nsswitch.conf
+GSHADOW=/etc/gshadow
+nss_local_only() {
+  local line src srcs
+  # read -a splits on blanks without expanding [NOTFOUND=return] as a glob.
+  while read -r line; do
+    read -ra srcs <<<"$line"
+    for src in "${srcs[@]}"; do
+      case "$src" in
+        files | systemd | \[*\]) ;;
+        *) return 1 ;;
+      esac
+    done
+  done < <(awk -F: '$1 ~ /^[ \t]*(passwd|group)[ \t]*$/ { sub(/#.*/, "", $2); print $2 }' "$NSSWITCH" 2>/dev/null)
+}
+only_member() {
+  case ",$1," in ,, | ",${TARGET_USER},") return 0 ;; esac
+  return 1
+}
 USER_GROUP=""
-if grp_entry=$(getent group "$TARGET_USER") &&
-  [ "$(printf '%s' "$grp_entry" | cut -d: -f3)" = "$TARGET_GID" ]; then
-  case ",$(printf '%s' "$grp_entry" | cut -d: -f4)," in
-    ,, | ",${TARGET_USER},")
-      if [ -z "$(getent passwd | awk -F: -v g="$TARGET_GID" -v u="$TARGET_USER" '$4 == g && $1 != u')" ]; then
-        USER_GROUP=$TARGET_USER
-      fi
-      ;;
-  esac
+if nss_local_only &&
+  grp_entry=$(getent group "$TARGET_USER") &&
+  [ "$(printf '%s' "$grp_entry" | cut -d: -f3)" = "$TARGET_GID" ] &&
+  only_member "$(printf '%s' "$grp_entry" | cut -d: -f4)" &&
+  [ "$(getent group | awk -F: -v g="$TARGET_GID" '$3 == g' | wc -l)" -eq 1 ] &&
+  [ -z "$(getent passwd | awk -F: -v g="$TARGET_GID" -v u="$TARGET_USER" '$4 == g && $1 != u')" ]; then
+  if [ ! -e "$GSHADOW" ] || { [ ! -r "$GSHADOW" ] && [ "$(id -u)" -ne 0 ]; }; then
+    USER_GROUP=$TARGET_USER
+  elif gs_members=$(awk -F: -v n="$TARGET_USER" '$1 == n { print $4 }' "$GSHADOW") &&
+    only_member "$gs_members"; then
+    USER_GROUP=$TARGET_USER
+  fi
 fi
 
 BUS="${RUN_USER}/${TARGET_UID}/bus"
@@ -519,6 +546,30 @@ if [ "${#conflicts[@]}" -gt 0 ]; then
   } >&2
   exit 1
 fi
+# Without a group of the desktop user's own, scan.conf and the risk register
+# could be shared with the report only by letting other local users read
+# them too. Refuse instead, before anything is changed.
+if [ -z "$USER_GROUP" ]; then
+  {
+    echo "${TARGET_USER} has no group of their own: a primary group named ${TARGET_USER}"
+    echo "that is the only group with its GID, has no other member, and is no other"
+    echo "account's primary group, on a machine that looks up accounts and groups only"
+    echo "in the local files and systemd."
+    echo "The weekly report reads ${ETC}/scan.conf and ${ETC}/risk-register.toml as"
+    echo "${TARGET_USER}, and they hold the user name, home folder and repository paths, so"
+    echo "they are shared through that group and with no one else."
+    echo "Nothing has been changed. Give ${TARGET_USER} such a group, log in again, and run"
+    echo "this again."
+    if ! getent group "$TARGET_USER" >/dev/null; then
+      echo "For example: groupadd ${TARGET_USER} && usermod -g ${TARGET_USER} ${TARGET_USER}"
+    fi
+    if present "$ETC/scan.conf" || present "$ETC/risk-register.toml"; then
+      echo "An earlier version left files in ${ETC} that other users may be able to read."
+      echo "Until then, run: chmod o-rwx ${ETC}/*"
+    fi
+  } >&2
+  exit 1
+fi
 echo "  nothing in the way"
 
 # ---------------------------------------------------------------------------
@@ -623,13 +674,9 @@ HOME_RE=$(regex_escape "$TARGET_HOME")
 # are read only by the scans, which run as root, and are root's alone (0600).
 # The report runs as the desktop user and reads the risk register and
 # scan.conf, so those two are shared with the desktop user's own group (0640).
+# The preflight has refused to install without such a group.
 REPORT_MODE=0640
 REPORT_GROUP=$USER_GROUP
-if [ -z "$USER_GROUP" ]; then
-  REPORT_MODE=0644
-  REPORT_GROUP=root
-  NOTES+=("${TARGET_USER} has no group of their own, so ${ETC}/scan.conf and ${ETC}/risk-register.toml stay readable by every local user, or the weekly report could not read them. They hold your user name, home folder and repository paths.")
-fi
 
 # Versions before 0.2.10 installed every file here readable by everyone.
 # tighten takes away what a file no longer needs, once: its mode becomes the
@@ -655,7 +702,15 @@ tighten() {
     echo "  make ${path} private (mode 0${cur#0} to ${new})"
     run chmod "$new" "$path"
   fi
-  if [ "$group" != root ] && [ $((8#$new & 8#040)) -ne 0 ] &&
+  # A file the group may still read belongs to root's group or GROUP and to
+  # no other: one an administrator gave to a group such as "users" would
+  # stay readable by all of its members, so it moves to GROUP. A file only
+  # root reads has no group bits left after its mask.
+  if [ "$group" != root ] && [ $((8#$new & 8#070)) -ne 0 ] &&
+    [ "$(stat -c %g -- "$path")" != 0 ] && [ "$(stat -c %G -- "$path")" != "$group" ]; then
+    echo "  take ${path} from group $(stat -c %G -- "$path")"
+    run chown "root:${group}" "$path"
+  elif [ "$group" != root ] && [ $((8#$new & 8#040)) -ne 0 ] &&
     [ "$(stat -c %g -- "$path")" = 0 ]; then
     run chown "root:${group}" "$path"
   fi

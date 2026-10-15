@@ -410,7 +410,9 @@ come from PyPI, pinned to the exact versions and SHA-256 hashes in
 `system/picklescan-requirements.txt`, so what runs as root is fixed by the
 commit you install from. The installer adds the
 rest from the official repositories; see
-[INSTALL.md](INSTALL.md#requirements).
+[INSTALL.md](INSTALL.md#requirements). Your account needs a primary group of
+its own in the local account files, or the installer refuses to install; see
+[INSTALL.md](INSTALL.md#configuration).
 
 ## Changelog
 
